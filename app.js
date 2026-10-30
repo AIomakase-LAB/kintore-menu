@@ -2,8 +2,8 @@
 (function () {
   'use strict';
 
-  var VERSION = '1.0.0';
-  var LS = { conn: 'km.conn', data: 'km.data', outbox: 'km.outbox', draft: 'km.draft', settings: 'km.settings', demo: 'km.demo' };
+  var VERSION = '1.1.0';
+  var LS = { conn: 'km.conn', data: 'km.data', outbox: 'km.outbox', draft: 'km.draft', settings: 'km.settings', demo: 'km.demo', ivl: 'km.ivl' };
   var WD = ['日', '月', '火', '水', '木', '金', '土'];
   var KIND_LABEL = { weight: '重量', bodyweight: '自重', time: '時間' };
 
@@ -274,6 +274,35 @@
     return Math.max(5, Math.round(sec / 60 / 5) * 5);
   }
 
+  /** 同じメニューの直近5回の平均（分）。実績がなければ null。 */
+  function menuAvgMin(name) {
+    var d = state.data.sessions.filter(function (s) { return s.menuName === name && s.duration > 0; })
+      .sort(function (a, b) { return a.date < b.date ? -1 : 1; }).slice(-5)
+      .map(function (s) { return s.duration; });
+    return d.length ? Math.round(d.reduce(function (a, b) { return a + b; }, 0) / d.length) : null;
+  }
+  function durLabel(menu) {
+    var avg = menuAvgMin(menu.name);
+    return avg ? '平均' + avg + '分' : '約' + estimateMin(menu) + '分';
+  }
+  /** 1セットあたりの実測ペース（秒、休憩込み）。実績がなければ null。 */
+  function paceSec(name) {
+    var xs = state.data.sessions.filter(function (s) { return s.menuName === name && s.duration > 0 && s.sets.length; })
+      .sort(function (a, b) { return a.date < b.date ? -1 : 1; }).slice(-5)
+      .map(function (s) { return s.duration * 60 / s.sets.length; });
+    return xs.length ? xs.reduce(function (a, b) { return a + b; }, 0) / xs.length : null;
+  }
+  function remainingSec() {
+    var sec = 0;
+    draft.exercises.forEach(function (e) {
+      e.sets.forEach(function (s) {
+        if (s.done) return;
+        sec += draft.pace || ((e.kind === 'time' ? +s.r : 40) + e.rest);
+      });
+    });
+    return sec;
+  }
+
   function suggestedMenu() {
     var menus = state.data.menus.slice();
     if (!menus.length) return null;
@@ -351,7 +380,7 @@
       } else {
         var last = menuLastDone(m);
         hero = '<section class="hero"><div class="label">今日のおすすめ</div><h2>' + esc(m.name) + '</h2>' +
-          '<div class="meta"><span>' + m.exercises.length + '種目</span><span>約' + estimateMin(m) + '分</span><span>' + (last ? '前回 ' + fmtAgo(last) : 'まだ未実施') + '</span></div>' +
+          '<div class="meta"><span>' + m.exercises.length + '種目</span><span>' + durLabel(m) + '</span><span>' + (last ? '前回 ' + fmtAgo(last) : 'まだ未実施') + '</span></div>' +
           '<div class="ex-chips">' + m.exercises.slice(0, 6).map(function (e) { return '<span>' + esc(e.name) + '</span>'; }).join('') + '</div>' +
           '<div class="actions"><button class="btn lg start" data-act="start" data-id="' + esc(m.id) + '">' + icon('play') + 'トレーニング開始</button>' +
           (state.data.menus.length > 1 ? '<button class="btn lg alt" data-act="pick-menu">変更</button>' : '') + '</div></section>';
@@ -384,7 +413,12 @@
         : '<b>まだ記録がありません</b><div class="muted small">体重も一緒に残すと変化が分かります</div>') +
       '</div><button class="btn primary sm" data-act="body">記録する</button></div>';
 
-    return head + hero + stats + heat + prHtml + bodyHtml;
+    var c = ivlCfg();
+    var ivlCard = '<button class="card row ivl-entry" data-act="ivl-open"><span class="badge">' +
+      '<svg viewBox="0 0 24 24" style="width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round"><circle cx="12" cy="13.5" r="7.5"/><path d="M12 9.5v4l2.5 1.5M9.5 2.5h5"/></svg></span>' +
+      '<div class="grow"><b>インターバルタイマー</b><div class="muted small tnum">' + c.work + '秒運動 / ' + c.rest + '秒休憩 × ' + c.rounds + 'ラウンド ・ ' + fmtClock(ivlTotal(c)) + '</div></div>' +
+      '<span class="muted">›</span></button>';
+    return head + hero + '<div style="margin-top:12px">' + ivlCard + '</div>' + stats + heat + prHtml + bodyHtml;
   }
 
   function heatmap() {
@@ -410,7 +444,7 @@
       var last = menuLastDone(m);
       return '<div class="card row" ' + (state.menuSort ? '' : 'data-act="menu-edit" data-id="' + esc(m.id) + '" style="cursor:pointer"') + '>' +
         '<span class="badge">' + esc(m.name.slice(0, 1)) + '</span><div class="grow"><b>' + esc(m.name) + '</b>' +
-        '<div class="muted small">' + m.exercises.length + '種目 ・ 約' + estimateMin(m) + '分 ・ ' + (last ? fmtAgo(last) : '未実施') + '</div></div>' +
+        '<div class="muted small">' + m.exercises.length + '種目 ・ ' + durLabel(m) + ' ・ ' + (last ? fmtAgo(last) : '未実施') + '</div></div>' +
         (state.menuSort
           ? '<button class="icon-btn" data-act="menu-move" data-i="' + i + '" data-d="-1" ' + (i === 0 ? 'disabled' : '') + ' aria-label="上へ">' + icon('up') + '</button>' +
             '<button class="icon-btn" data-act="menu-move" data-i="' + i + '" data-d="1" ' + (i === menus.length - 1 ? 'disabled' : '') + ' aria-label="下へ">' + icon('down') + '</button>'
@@ -715,7 +749,7 @@
     if (draft && !confirm('「' + draft.menuName + '」の途中の記録があります。破棄して新しく始めますか？')) { openWorkout(); return; }
     var hist = exerciseHistory();
     draft = {
-      id: uid(), menuName: menu.name, startedAt: Date.now(), date: today(), memo: '', restEnd: null, restTotal: 0,
+      id: uid(), menuName: menu.name, startedAt: Date.now(), date: today(), memo: '', restEnd: null, restTotal: 0, pace: paceSec(menu.name),
       exercises: menu.exercises.map(function (e) {
         var h = hist[e.name], prev = h ? h[h.length - 1].sets : null;
         var sets = [];
@@ -768,7 +802,7 @@
 
   function workoutHtml() {
     var html = '<div class="workout-head"><button class="icon-btn" data-act="w-minimize" aria-label="閉じる">' + icon('min') + '</button>' +
-      '<div class="title"><b>' + esc(draft.menuName) + '</b><span class="tnum" id="wClock">0:00</span></div>' +
+      '<div class="title"><b>' + esc(draft.menuName) + '</b><span class="tnum" id="wClock">0:00</span><span class="tnum" id="wRemain"></span></div>' +
       '<button class="btn sm" data-act="w-discard">破棄</button></div>' +
       '<div class="workout-progress"><i id="wProg"></i></div><div class="workout-body">';
     draft.exercises.forEach(function (e, ei) {
@@ -823,7 +857,9 @@
   function onTick() {
     if (!draft) return;
     var c = $('#wClock');
-    if (c) c.textContent = fmtClock((Date.now() - draft.startedAt) / 1000);
+    if (c) c.textContent = '経過 ' + fmtClock((Date.now() - draft.startedAt) / 1000);
+    var rm = $('#wRemain'), left = remainingSec();
+    if (rm) rm.textContent = left > 0 ? ' ・ 残り約' + Math.max(1, Math.round(left / 60)) + '分' : ' ・ 全セット完了';
     renderRest();
     renderHold();
   }
@@ -942,7 +978,7 @@
 
     openSheet('<div class="summary-hero"><div class="emoji">' + (prs.length ? '🔥' : '💪') + '</div><h3>おつかれさまでした！</h3>' +
       '<div class="muted small">' + esc(draft.menuName) + '</div></div>' +
-      '<div class="summary-grid"><div class="stat"><div class="v tnum">' + minutes + '<small>分</small></div><div class="k">時間</div></div>' +
+      '<div class="summary-grid"><div class="stat"><div class="v tnum">' + minutes + '<small>分</small></div><div class="k">時間' + paceNote(minutes) + '</div></div>' +
       '<div class="stat"><div class="v tnum">' + sets.length + '<small>セット</small></div><div class="k">完了</div></div>' +
       '<div class="stat"><div class="v tnum">' + (volume ? fmtBig(volume).replace(/(kg|t)$/, '<small>$1</small>') : '–') + '</div><div class="k">総重量</div></div>' +
       '<div class="stat"><div class="v tnum">' + prs.length + '<small>件</small></div><div class="k">自己ベスト更新</div></div></div>' +
@@ -954,6 +990,12 @@
       function () { pendingSession = session; });
   }
   var pendingSession = null;
+  function paceNote(minutes) {
+    var avg = menuAvgMin(draft.menuName);
+    if (!avg) return '';
+    var d = minutes - avg;
+    return '（平均より' + (d === 0 ? '同じ' : Math.abs(d) + '分' + (d > 0 ? '長い' : '短い')) + '）';
+  }
 
   function prevBestFor(name) {
     var h = exerciseHistory()[name];
@@ -987,6 +1029,147 @@
       g.gain.exponentialRampToValueAtTime(0.0001, t + (len || 0.2));
       o.start(t); o.stop(t + (len || 0.2) + 0.02);
     }
+  }
+
+  // ---- インターバルタイマー ----
+  var IVL_PRESETS = [
+    { name: 'タバタ', work: 20, rest: 10, rounds: 8 },
+    { name: '30/15', work: 30, rest: 15, rounds: 8 },
+    { name: '40/20', work: 40, rest: 20, rounds: 6 },
+    { name: '45/15', work: 45, rest: 15, rounds: 10 },
+    { name: '60/30', work: 60, rest: 30, rounds: 5 }
+  ];
+  var IVL_READY = 5;
+  var ivl = null, ivlTick = null;
+
+  function ivlCfg() {
+    var c = Object.assign({ work: 30, rest: 15, rounds: 8 }, load(LS.ivl, {}));
+    c.work = Math.min(600, Math.max(5, +c.work || 30));
+    c.rest = Math.min(600, Math.max(0, isNaN(+c.rest) ? 15 : +c.rest));
+    c.rounds = Math.min(50, Math.max(1, Math.round(+c.rounds) || 8));
+    return c;
+  }
+  function ivlClamp(c) {
+    c.work = Math.min(600, Math.max(5, +c.work || 5));
+    c.rest = Math.min(600, Math.max(0, +c.rest || 0));
+    c.rounds = Math.min(50, Math.max(1, Math.round(+c.rounds) || 1));
+    return c;
+  }
+  function ivlTotal(c) { return IVL_READY + c.rounds * c.work + (c.rounds - 1) * c.rest; }
+  function ivlSegments(c) {
+    var seg = [{ t: 'ready', d: IVL_READY, r: 0 }];
+    for (var r = 1; r <= c.rounds; r++) {
+      seg.push({ t: 'work', d: c.work, r: r });
+      if (r < c.rounds && c.rest > 0) seg.push({ t: 'rest', d: c.rest, r: r });
+    }
+    return seg;
+  }
+
+  function ivlSheet() {
+    var c = ivlCfg();
+    function row(label, f, v, unit, step) {
+      return '<div class="field"><span>' + label + '</span><div class="stepper" style="height:52px">' +
+        '<button data-act="ivl-step" data-f="' + f + '" data-d="-' + step + '" aria-label="減らす">−</button>' +
+        '<input type="number" inputmode="numeric" data-ivl="' + f + '" value="' + v + '" style="font-size:20px">' +
+        '<span class="muted small" style="flex:none">' + unit + '</span>' +
+        '<button data-act="ivl-step" data-f="' + f + '" data-d="' + step + '" aria-label="増やす">＋</button></div></div>';
+    }
+    openSheet('<h3>インターバルタイマー</h3>' +
+      '<div class="chips" style="margin-top:10px">' + IVL_PRESETS.map(function (p, i) {
+        var on = p.work === c.work && p.rest === c.rest && p.rounds === c.rounds;
+        return '<button class="' + (on ? 'on' : '') + '" data-act="ivl-preset" data-i="' + i + '">' + p.name + '</button>';
+      }).join('') + '</div>' +
+      row('運動', 'work', c.work, '秒', 5) + row('休憩', 'rest', c.rest, '秒', 5) + row('ラウンド数', 'rounds', c.rounds, '回', 1) +
+      '<div class="foot"><button class="btn lg" data-act="sheet-close" style="flex:1">閉じる</button><button class="btn primary lg" data-act="ivl-start" style="flex:3;white-space:nowrap">' + icon('play') + 'スタート（' + fmtClock(ivlTotal(c)) + '）</button></div>');
+  }
+
+  function ivlStart() {
+    var c = ivlCfg();
+    unlockAudio();
+    closeSheet();
+    var segs = ivlSegments(c);
+    ivl = { cfg: c, segs: segs, total: segs.reduce(function (a, x) { return a + x.d; }, 0), startAt: Date.now(), pausedAt: null, idx: -1, lastSec: null, finished: false };
+    $('#layer').insertAdjacentHTML('afterbegin',
+      '<div class="ivl" id="ivl"><div class="ivl-top"><button class="icon-btn" data-act="ivl-end" aria-label="終了">' + icon('close') + '</button>' +
+      '<b id="ivlRound"></b><span style="width:40px"></span></div>' +
+      '<div class="ivl-phase" id="ivlPhase"></div><div class="ivl-time tnum" id="ivlTime"></div><div class="ivl-next" id="ivlNext"></div>' +
+      '<div class="ivl-bar"><i id="ivlBar"></i></div>' +
+      '<div class="ivl-actions"><button class="btn lg" data-act="ivl-pause" id="ivlPause">一時停止</button><button class="btn lg" data-act="ivl-skip">スキップ</button></div></div>');
+    document.body.style.overflow = 'hidden';
+    requestWake();
+    clearInterval(ivlTick);
+    ivlTick = setInterval(ivlRender, 200);
+    ivlRender();
+  }
+
+  /** 経過秒から、いま何番目の区間の何秒目かを求める（時刻で管理するので画面を閉じても狂わない）。 */
+  function ivlPos() {
+    var el = ((ivl.pausedAt || Date.now()) - ivl.startAt) / 1000, acc = 0;
+    for (var i = 0; i < ivl.segs.length; i++) {
+      if (el < acc + ivl.segs[i].d) return { i: i, left: acc + ivl.segs[i].d - el, el: el };
+      acc += ivl.segs[i].d;
+    }
+    return { i: ivl.segs.length, left: 0, el: ivl.total };
+  }
+
+  function ivlRender() {
+    if (!ivl || ivl.finished) return;
+    var pos = ivlPos(), box = $('#ivl');
+    if (!box) return;
+    if (pos.i >= ivl.segs.length) { ivlComplete(); return; }
+    var seg = ivl.segs[pos.i], c = ivl.cfg;
+    if (pos.i !== ivl.idx) {
+      var first = ivl.idx < 0;
+      ivl.idx = pos.i; ivl.lastSec = null;
+      box.className = 'ivl ' + seg.t;
+      $('#ivlPhase').textContent = seg.t === 'work' ? '運動' : seg.t === 'rest' ? '休憩' : '準備';
+      $('#ivlRound').textContent = seg.t === 'ready' ? c.rounds + 'ラウンド' : seg.r + ' / ' + c.rounds;
+      var nxt = ivl.segs[pos.i + 1];
+      $('#ivlNext').textContent = nxt ? '次：' + (nxt.t === 'work' ? '運動 ' + nxt.d + '秒（' + nxt.r + '/' + c.rounds + '）' : '休憩 ' + nxt.d + '秒') : '最後のラウンド！';
+      if (!first) beep(1, seg.t === 'work' ? 990 : 660, seg.t === 'work' ? 0.3 : 0.2);
+    }
+    var sec = Math.ceil(pos.left);
+    if (sec !== ivl.lastSec) {
+      ivl.lastSec = sec;
+      $('#ivlTime').textContent = sec;
+      if (sec <= 3 && sec >= 1 && !ivl.pausedAt && seg.d > 3) beep(1, 780, 0.08);
+    }
+    $('#ivlBar').style.width = Math.min(100, pos.el / ivl.total * 100) + '%';
+    $('#ivlPause').textContent = ivl.pausedAt ? '再開' : '一時停止';
+  }
+
+  function ivlRoundsDone() {
+    var pos = ivlPos(), n = 0;
+    for (var i = 0; i < Math.min(pos.i, ivl.segs.length); i++) if (ivl.segs[i].t === 'work') n++;
+    return n;
+  }
+
+  function ivlComplete() {
+    if (ivl.finished) return;
+    ivl.finished = true;
+    clearInterval(ivlTick);
+    beep(3);
+    ivlFinishSheet(true);
+  }
+
+  function ivlFinishSheet(completed) {
+    var c = ivl.cfg, n = completed ? c.rounds : ivlRoundsDone();
+    var minutes = Math.max(1, Math.round((completed ? ivl.total : ivlPos().el) / 60));
+    if (n < 1) { ivlClose(); return; }
+    ivl.save = { rounds: n, minutes: minutes };
+    openSheet('<div class="summary-hero"><div class="emoji">' + (completed ? '🔥' : '💪') + '</div><h3>' + (completed ? '完走！' : 'おつかれさまでした') + '</h3>' +
+      '<div class="muted small">' + c.work + '秒運動 / ' + c.rest + '秒休憩</div></div>' +
+      '<div class="summary-grid"><div class="stat"><div class="v tnum">' + n + '<small>ラウンド</small></div><div class="k">完了</div></div>' +
+      '<div class="stat"><div class="v tnum">' + minutes + '<small>分</small></div><div class="k">時間</div></div></div>' +
+      '<label class="field"><span>日付</span><input class="input" type="date" id="fDate" value="' + today() + '"></label>' +
+      '<div class="foot"><button class="btn block lg" data-act="ivl-discard">保存しない</button><button class="btn primary block lg" data-act="ivl-save">記録する</button></div>');
+  }
+
+  function ivlClose() {
+    clearInterval(ivlTick);
+    var b = $('#ivl'); if (b) b.remove();
+    ivl = null;
+    if (!draft || !$('.workout')) { document.body.style.overflow = ''; releaseWake(); }
   }
 
   // ---- セットアップ ----
@@ -1197,6 +1380,48 @@
     'stats-ex': function (el) { state.statsEx = el.getAttribute('data-name'); state.statsMetric = null; render(); },
     'stats-metric': function (el) { state.statsMetric = el.getAttribute('data-k'); render(); },
 
+    // インターバルタイマー
+    'ivl-open': function () { unlockAudio(); ivlSheet(); },
+    'ivl-preset': function (el) { save(LS.ivl, IVL_PRESETS[+el.getAttribute('data-i')]); ivlSheet(); render(); },
+    'ivl-step': function (el) {
+      var c = ivlCfg(), f = el.getAttribute('data-f');
+      c[f] = +c[f] + +el.getAttribute('data-d');
+      save(LS.ivl, ivlClamp(c)); ivlSheet(); render();
+    },
+    'ivl-start': ivlStart,
+    'ivl-pause': function () {
+      if (!ivl) return;
+      if (ivl.pausedAt) { ivl.startAt += Date.now() - ivl.pausedAt; ivl.pausedAt = null; }
+      else ivl.pausedAt = Date.now();
+      ivlRender();
+    },
+    'ivl-skip': function () {
+      if (!ivl) return;
+      ivl.startAt -= ivlPos().left * 1000;
+      ivlRender();
+    },
+    'ivl-end': function () {
+      if (!ivl || ivl.finished) return;
+      var wasPaused = !!ivl.pausedAt;
+      if (!wasPaused) ivl.pausedAt = Date.now();
+      if (!confirm('タイマーを終了しますか？')) {
+        if (!wasPaused) { ivl.startAt += Date.now() - ivl.pausedAt; ivl.pausedAt = null; }
+        return;
+      }
+      ivl.finished = true;
+      clearInterval(ivlTick);
+      ivlFinishSheet(false);
+    },
+    'ivl-save': function () {
+      var sv = ivl.save, c = ivl.cfg, date = $('#fDate').value || today(), sets = [];
+      for (var i = 1; i <= sv.rounds; i++) sets.push({ exercise: 'インターバル', kind: 'time', setNo: i, weight: 0, reps: c.work });
+      var session = { id: uid(), date: date, menuName: 'インターバル ' + c.work + '/' + c.rest, memo: '', duration: sv.minutes, sets: sets };
+      closeSheet(); ivlClose();
+      mutate('saveSession', session, function (d) { d.sessions.push(session); });
+      toast('記録しました 💪');
+    },
+    'ivl-discard': function () { closeSheet(); ivlClose(); },
+
     // トレーニング中
     'w-minimize': function () { saveDraft(); closeWorkout(); },
     'w-discard': function () {
@@ -1269,6 +1494,12 @@
   });
 
   // トレーニング中の数値入力・メモ
+  document.addEventListener('change', function (ev) {
+    var f = ev.target.getAttribute && ev.target.getAttribute('data-ivl');
+    if (!f) return;
+    var c = ivlCfg(); c[f] = +ev.target.value;
+    save(LS.ivl, ivlClamp(c)); ivlSheet(); render();
+  });
   document.addEventListener('input', function (ev) {
     var t = ev.target;
     if (!draft) return;
@@ -1288,7 +1519,9 @@
   window.addEventListener('online', function () { flush(); });
   document.addEventListener('visibilitychange', function () {
     if (document.visibilityState !== 'visible') return;
-    if (draft && $('.workout')) { requestWake(); onTick(); }
+    if ((draft && $('.workout')) || ivl) requestWake();
+    if (draft && $('.workout')) onTick();
+    if (ivl) ivlRender();
     if (state.conn && !state.conn.demo) flush();
   });
   setInterval(function () { if (state.sync === 'off' && navigator.onLine) flush(); }, 30000);
