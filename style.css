@@ -413,3 +413,13 @@ textarea.input { min-height: 80px; resize: vertical; }
 .file-btn.busy { opacity: .6; pointer-events: none; }
 .vid-line { margin: 10px 2px 0; }
 .vid-toggle.add { background: transparent; border: 1.5px dashed var(--line); color: var(--text-2); }
+
+/* ---- ドライブのバックアップ ---- */
+.dcard { margin-top: 12px; }
+.restore-banner { display: flex; align-items: center; gap: 10px; margin-top: 12px; padding: 12px; border-radius: 12px; background: var(--accent-soft); color: var(--text); }
+.pill.cloud { background: color-mix(in srgb, #2f7fe0 15%, transparent); color: #2f7fe0; }
+.pill.warn { background: color-mix(in srgb, var(--danger) 12%, transparent); color: var(--danger); }
+.thumb.dim { opacity: .55; }
+.vs-backup { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+.vs-backup .bar { height: 6px; border-radius: 3px; background: var(--surface-2); margin-top: 6px; overflow: hidden; }
+.vs-backup .bar i { display: block; height: 100%; background: var(--accent); transition: width .3s; }

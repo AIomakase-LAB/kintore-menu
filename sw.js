@@ -1,6 +1,6 @@
 // アプリ本体をキャッシュしてオフラインでも起動できるようにする。
 // データ通信 (script.google.com) には関与しない。
-const CACHE = 'kintore-v1.4.0';
+const CACHE = 'kintore-v1.5.0';
 const SHELL = ['./', 'index.html', 'style.css', 'app.js', 'manifest.webmanifest',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png'];
 

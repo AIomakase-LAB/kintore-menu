@@ -2,7 +2,7 @@
 (function () {
   'use strict';
 
-  var VERSION = '1.4.0';
+  var VERSION = '1.5.0';
   var LS = { conn: 'km.conn', data: 'km.data', outbox: 'km.outbox', draft: 'km.draft', settings: 'km.settings', demo: 'km.demo', ivl: 'km.ivl' };
   var WD = ['日', '月', '火', '水', '木', '金', '土'];
   var KIND_LABEL = { weight: '重量', bodyweight: '自重', time: '時間' };
@@ -37,7 +37,7 @@
     conn: load(LS.conn, null),
     data: normalize(load(LS.data, null)),
     outbox: load(LS.outbox, []),
-    settings: Object.assign({ weeklyGoal: 3, weightStep: 1, sound: true }, load(LS.settings, {})),
+    settings: Object.assign({ weeklyGoal: 3, weightStep: 1, sound: true, autoBackup: true }, load(LS.settings, {})),
     tab: 'home',
     sync: 'idle',
     openSession: null,
@@ -99,7 +99,7 @@
       var el = document.createElement('video');
       el.src = v.src; el.loop = true; el.muted = true; el.autoplay = true; el.controls = true; el.playsInline = true;
       el.setAttribute('muted', ''); el.setAttribute('playsinline', ''); el.preload = 'auto';
-      el.addEventListener('error', function () { box.innerHTML = '<div class="vid-err">動画を読み込めませんでした。URLを確認してください。</div>'; });
+      el.addEventListener('error', function () { box.innerHTML = '<div class="vid-err">動画を再生できませんでした。' + (/^blob:/.test(v.src) ? 'この形式に対応していない可能性があります。' : 'URLを確認してください。') + '</div>'; });
       box.appendChild(el);
     } else {
       var img = document.createElement('img');
@@ -115,6 +115,7 @@
   var MAX_LOCAL_BYTES = 150 * 1024 * 1024;
   var localVideos = {};   // 種目名 -> サイズ(bytes)
   var localThumbs = {};   // 種目名 -> サムネイル(data URL)
+  var localSavedAt = {};  // 種目名 -> 保存日時（ドライブの目録と同じならバックアップ済み）
   var vdbPromise = null;
   function vdb() {
     if (!vdbPromise) {
@@ -140,22 +141,25 @@
   }
   function hasLocal(name) { return Object.prototype.hasOwnProperty.call(localVideos, name); }
   function vdbGet(name) { return vdbTx('readonly', function (st) { return st.get(name); }); }
-  function vdbPut(name, blob, thumb) {
-    return vdbTx('readwrite', function (st) { return st.put({ name: name, blob: blob, type: blob.type, size: blob.size, thumb: thumb || null, savedAt: Date.now() }); })
+  function vdbPut(name, blob, thumb, savedAt) {
+    var at = savedAt || Date.now();
+    return vdbTx('readwrite', function (st) { return st.put({ name: name, blob: blob, type: blob.type, size: blob.size, thumb: thumb || null, savedAt: at }); })
       .then(function () {
         localVideos[name] = blob.size;
+        localSavedAt[name] = at;
         if (thumb) localThumbs[name] = thumb; else delete localThumbs[name];
         if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(function () {});
       });
   }
-  function vdbDel(name) { return vdbTx('readwrite', function (st) { return st.delete(name); }).then(function () { delete localVideos[name]; delete localThumbs[name]; }); }
-  function vdbClear() { return vdbTx('readwrite', function (st) { return st.clear(); }).then(function () { localVideos = {}; localThumbs = {}; }); }
+  function vdbDel(name) { return vdbTx('readwrite', function (st) { return st.delete(name); }).then(function () { delete localVideos[name]; delete localThumbs[name]; delete localSavedAt[name]; }); }
+  function vdbClear() { return vdbTx('readwrite', function (st) { return st.clear(); }).then(function () { localVideos = {}; localThumbs = {}; localSavedAt = {}; }); }
   function vdbLoad() {
     return vdbTx('readonly', function (st) { return st.getAll(); }).then(function (all) {
-      localVideos = {}; localThumbs = {};
+      localVideos = {}; localThumbs = {}; localSavedAt = {};
       var missing = [];
       (all || []).forEach(function (v) {
         localVideos[v.name] = v.size;
+        localSavedAt[v.name] = v.savedAt;
         if (v.thumb) localThumbs[v.name] = v.thumb; else missing.push(v);
       });
       if (state.tab === 'videos') render();
@@ -164,11 +168,171 @@
         return chain.then(function () {
           return makeThumb(v.blob).then(function (t) {
             if (!t) return null;
-            return vdbPut(v.name, v.blob, t).then(function () { if (state.tab === 'videos') render(); });
+            return vdbPut(v.name, v.blob, t, v.savedAt).then(function () { if (state.tab === 'videos') render(); });
           });
         });
       }, Promise.resolve()).catch(function () {});
     }).catch(function () { /* 使えない環境では URL の動画だけ使う */ });
+  }
+
+  // ---- Googleドライブへのバックアップ ----
+  // 動画を 4MB ずつ base64 にして Apps Script 経由でドライブに送る。復元は逆順で組み立てる。
+  var CHUNK = 4 * 1024 * 1024;
+  var drive = { list: null, loading: false, error: '' };  // list: 種目名 -> 目録
+  var jobs = {};          // 種目名 -> { mode: 'up' | 'down', p: 0..1 } または { error }
+  var jobQueue = [], jobBusy = false;
+
+  function canDrive() { return !!(state.conn && !state.conn.demo); }
+  function onDrive(name) { return !!(drive.list && drive.list[name]); }
+  function isBackedUp(name) { return onDrive(name) && hasLocal(name) && drive.list[name].localSavedAt === localSavedAt[name]; }
+  function driveErrorText(e) {
+    if (/不明な操作/.test(e.message)) return 'Apps Script の更新が必要です（PR のマージ待ち）';
+    if (e.network) return '接続できません。Apps Script の権限の許可がまだの場合は、許可してください';
+    return e.message;
+  }
+
+  function driveRefresh() {
+    if (!canDrive() || drive.loading) return Promise.resolve();
+    drive.loading = true;
+    return api('videoList').then(function (list) {
+      drive.list = {};
+      (list || []).forEach(function (m) { drive.list[m.name] = m; });
+      drive.error = '';
+      if (state.settings.autoBackup) Object.keys(localVideos).forEach(function (n) { if (!isBackedUp(n)) queueJob(n, 'up'); });
+    }, function (e) { drive.error = driveErrorText(e); }).then(function () {
+      drive.loading = false;
+      jobChanged(null);
+    });
+  }
+
+  function queueJob(name, mode) {
+    if (!canDrive() || jobQueue.some(function (j) { return j.name === name; }) || (jobs[name] && !jobs[name].error)) return;
+    jobQueue.push({ name: name, mode: mode });
+    jobs[name] = { mode: mode, p: 0 };
+    jobChanged(name);
+    runJobs();
+  }
+
+  function runJobs() {
+    if (jobBusy || !jobQueue.length) return;
+    jobBusy = true;
+    var j = jobQueue.shift();
+    (j.mode === 'up' ? backupOne(j.name) : restoreOne(j.name)).then(function () {
+      delete jobs[j.name];
+      toast(j.mode === 'up' ? '「' + j.name + '」をドライブにバックアップしました' : '「' + j.name + '」を復元しました');
+    }, function (e) {
+      jobs[j.name] = { mode: j.mode, error: driveErrorText(e) };
+      toast((j.mode === 'up' ? 'バックアップ' : '復元') + 'に失敗しました：' + driveErrorText(e), true);
+    }).then(function () {
+      jobBusy = false;
+      jobChanged(j.name);
+      runJobs();
+    });
+  }
+
+  /** 通信が切れたときだけ少し待って再試行する。 */
+  function retry(fn, n) {
+    return fn().catch(function (e) {
+      if (!e.network || n <= 0) throw e;
+      return new Promise(function (r) { setTimeout(r, 2500); }).then(function () { return retry(fn, n - 1); });
+    });
+  }
+  function blobToB64(blob) {
+    return new Promise(function (res, rej) {
+      var r = new FileReader();
+      r.onload = function () { res(String(r.result).split(',')[1] || ''); };
+      r.onerror = function () { rej(r.error || new Error('ファイルを読めませんでした')); };
+      r.readAsDataURL(blob);
+    });
+  }
+  function b64ToBytes(b64) {
+    var bin = atob(b64), out = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  function backupOne(name) {
+    return vdbGet(name).then(function (rec) {
+      if (!rec) throw new Error('動画が見つかりません');
+      var blob = rec.blob, parts = Math.max(1, Math.ceil(blob.size / CHUNK)), uploadId = uid().replace(/[^A-Za-z0-9-]/g, '').slice(0, 40), i = 0;
+      function next() {
+        if (i >= parts) {
+          return retry(function () {
+            return api('videoFinish', { name: name, uploadId: uploadId, parts: parts, type: rec.type, size: rec.size, localSavedAt: rec.savedAt, thumb: rec.thumb || '' });
+          }, 2);
+        }
+        return blobToB64(blob.slice(i * CHUNK, (i + 1) * CHUNK)).then(function (data) {
+          return retry(function () { return api('videoPart', { name: name, uploadId: uploadId, index: i, data: data }); }, 3);
+        }).then(function () {
+          i++;
+          jobs[name] = { mode: 'up', p: i / (parts + 0.5) };
+          jobChanged(name);
+          return next();
+        });
+      }
+      return next().then(function (m) { drive.list = drive.list || {}; drive.list[name] = m; });
+    });
+  }
+
+  function restoreOne(name) {
+    var m = drive.list && drive.list[name];
+    if (!m) return Promise.reject(new Error('バックアップが見つかりません'));
+    var chunks = [], i = 0;
+    function next() {
+      if (i >= m.parts) return Promise.resolve();
+      return retry(function () { return api('videoGetPart', { name: name, uploadId: m.uploadId, index: i }); }, 3).then(function (r) {
+        chunks.push(b64ToBytes(r.data));
+        i++;
+        jobs[name] = { mode: 'down', p: i / m.parts };
+        jobChanged(name);
+        return next();
+      });
+    }
+    return next().then(function () {
+      var blob = new Blob(chunks, { type: m.type || 'video/mp4' });
+      if (m.size && blob.size !== m.size) throw new Error('受け取ったデータの大きさが合いません');
+      // 保存日時を目録と同じにして「バックアップ済み」と分かるようにする
+      return vdbPut(name, blob, m.thumb || null, m.localSavedAt || Date.now());
+    }).then(function () { afterVideoChange(name); });
+  }
+
+  function jobChanged(name) {
+    if (state.tab === 'videos') render();
+    var line = $('#vsBackup');
+    if (line && (name === null || name === vsName)) line.innerHTML = backupLineHtml(vsName);
+  }
+
+  function backupLineHtml(name) {
+    if (!canDrive()) return '<span class="muted small">☁️ デモではGoogleドライブに保存できません</span>';
+    var j = jobs[name];
+    if (j && !j.error) return '<span class="small">☁️ ' + (j.mode === 'up' ? 'ドライブにアップロード中' : 'ドライブから復元中') + ' ' + Math.round(j.p * 100) + '%</span><div class="bar"><i style="width:' + Math.round(j.p * 100) + '%"></i></div>';
+    if (hasLocal(name)) {
+      if (isBackedUp(name)) return '<span class="small" style="color:var(--good)">☁️ Googleドライブにバックアップ済み</span>';
+      return '<div class="row"><span class="grow small" style="color:var(--danger)">☁️ ' + (j && j.error ? 'バックアップ失敗：' + esc(j.error) : drive.list ? 'まだバックアップされていません' : 'ドライブの状態を確認中…') + '</span>' +
+        '<button class="btn sm" data-act="vs-backup">バックアップ</button></div>';
+    }
+    if (onDrive(name)) {
+      return '<div class="row"><span class="grow small">☁️ ドライブにバックアップがあります（' + fmtMB(drive.list[name].size || 0) + '）' + (j && j.error ? '<br><span style="color:var(--danger)">' + esc(j.error) + '</span>' : '') + '</span>' +
+        '<button class="btn primary sm" data-act="vs-restore">この端末に戻す</button></div>';
+    }
+    return '';
+  }
+
+  /** 動画タブ上部の「Googleドライブ」カード。 */
+  function driveCardHtml() {
+    if (!canDrive()) return '<div class="card dcard"><b>☁️ Googleドライブにバックアップ</b><div class="muted small">デモでは使えません。接続すると、スマホの動画をドライブにも保存できます。</div></div>';
+    var locals = Object.keys(localVideos), done = locals.filter(isBackedUp).length;
+    var restorable = drive.list ? Object.keys(drive.list).filter(function (n) { return !hasLocal(n); }) : [];
+    var running = Object.keys(jobs).filter(function (n) { return !jobs[n].error; });
+    var status = drive.error ? '<span style="color:var(--danger)">' + esc(drive.error) + '</span>'
+      : !drive.list ? '状態を確認中…'
+      : running.length ? '処理中 ' + running.length + '本（画面を開いたままにしてください）'
+      : locals.length ? 'バックアップ済み <b>' + done + '</b> / ' + locals.length + '本' : 'スマホの動画はまだありません';
+    return '<div class="card dcard"><div class="row"><span class="vg-ico">☁️</span><div class="grow"><b>Googleドライブにバックアップ</b><div class="small" style="color:var(--text-2)">' + status + '</div></div>' +
+      (drive.error ? '<button class="btn sm" data-act="drive-refresh">再確認</button>' : locals.length > done && !running.length ? '<button class="btn primary sm" data-act="drive-backup-all">今すぐ</button>' : '') + '</div>' +
+      (restorable.length ? '<div class="restore-banner"><div class="grow"><b>ドライブに、この端末にない動画が ' + restorable.length + '本あります</b><div class="small">Safariのデータを消した後などは、ここから戻せます</div></div><button class="btn primary sm" data-act="drive-restore-all">すべて戻す</button></div>' : '') +
+      '<div class="row" style="margin-top:12px"><span class="grow small">スマホの動画を保存したら自動でバックアップ</span><div class="seg" style="width:120px"><button data-act="set-autobackup" data-v="1" class="' + (state.settings.autoBackup ? 'on' : '') + '">ON</button><button data-act="set-autobackup" data-v="0" class="' + (!state.settings.autoBackup ? 'on' : '') + '">OFF</button></div></div>' +
+      '<div class="muted small" style="margin-top:8px">アップロード・復元には動画の大きさ分の通信量を使います（Wi‑Fiがおすすめ）。保存先：マイドライブ「筋トレメニュー（動画バックアップ）」</div></div>';
   }
 
   /** 動画・画像から一覧用の小さなサムネイルを作る。作れない形式や時間切れのときは null。 */
@@ -885,12 +1049,16 @@
   }
 
   function videoItem(name) {
-    var v = parseVideo(urlFor(name)), link = !!v && !v.error, local = hasLocal(name);
-    var bg = local && localThumbs[name] ? localThumbs[name] : link && v.type === 'youtube' ? 'https://i.ytimg.com/vi/' + v.id + '/mqdefault.jpg' : '';
+    var v = parseVideo(urlFor(name)), link = !!v && !v.error, local = hasLocal(name), remote = onDrive(name), j = jobs[name];
+    var bg = local && localThumbs[name] ? localThumbs[name] : link && v.type === 'youtube' ? 'https://i.ytimg.com/vi/' + v.id + '/mqdefault.jpg' : remote && drive.list[name].thumb ? drive.list[name].thumb : '';
+    var cloud = j && !j.error ? '<span class="pill">☁️ ' + (j.mode === 'up' ? '送信中' : '復元中') + ' ' + Math.round(j.p * 100) + '%</span>'
+      : local && isBackedUp(name) ? '<span class="pill cloud">☁️ バックアップ済み</span>'
+      : local && drive.list ? '<span class="pill warn">☁️ 未バックアップ</span>'
+      : !local && remote ? '<span class="pill warn">☁️ ドライブにだけあります</span>' : '';
     var tags = (local ? '<span class="pill local">📱 スマホの動画 ' + fmtMB(localVideos[name]) + '</span>' : '') +
-      (link ? '<span class="pill link">🔗 ' + (v.type === 'youtube' ? 'YouTube' : 'リンク') + '</span>' : '');
+      (link ? '<span class="pill link">🔗 ' + (v.type === 'youtube' ? 'YouTube' : 'リンク') + '</span>' : '') + (canDrive() ? cloud : '');
     return '<button class="vlist-item" data-act="vs-open" data-name="' + esc(name) + '">' +
-      '<span class="thumb' + (local || link ? ' has' : '') + '"' + (bg ? ' style="background-image:url(' + bg + ')"' : '') + '>' + (bg ? '' : local || link ? '🎬' : '＋') + '</span>' +
+      '<span class="thumb' + (local || link || remote ? ' has' : '') + (!local && remote && !link ? ' dim' : '') + '"' + (bg ? ' style="background-image:url(' + bg + ')"' : '') + '>' + (bg ? '' : local || link ? '🎬' : '＋') + '</span>' +
       '<div class="grow"><b>' + esc(name) + '</b><div class="tags">' + (tags || '<span class="muted small">未設定 ・ タップして追加</span>') + '</div></div>' +
       '<span class="muted chev">›</span></button>';
   }
@@ -908,7 +1076,7 @@
       });
       groups += '<div class="section-title">' + esc(m.name) + '</div><div class="card vlist">' + names.map(videoItem).join('') + '</div>';
     });
-    var orphans = Object.keys(localVideos).filter(function (n) { return !seen[n]; });
+    var orphans = Object.keys(localVideos).concat(drive.list ? Object.keys(drive.list) : []).filter(function (n, i, a) { return !seen[n] && a.indexOf(n) === i; });
     var bytes = Object.keys(localVideos).reduce(function (a, n) { return a + localVideos[n]; }, 0);
     var head = '<div class="page-head"><div><div class="eyebrow">フォーム動画</div><h1>動画</h1></div></div>';
     if (!state.data.menus.length) return head + '<div class="card empty-state"><div class="ico">🎬</div>先に「メニュー」タブでメニューを作ると、種目ごとに動画を登録できます。</div>';
@@ -916,6 +1084,7 @@
       '<div class="card vguide"><div class="row"><span class="vg-ico">📱</span><div class="grow"><b>スマホの動画</b><div class="muted small">撮った動画やGIFを保存。圏外でも再生できます（この端末だけ）</div></div></div>' +
       '<div class="row"><span class="vg-ico">🔗</span><div class="grow"><b>YouTubeなどのリンク</b><div class="muted small">リンクを貼るだけ。すべての端末で使えます</div></div></div>' +
       '<div class="vg-sum tnum">動画あり <b>' + withVideo + '</b> / ' + total + '種目' + (bytes ? ' ・ 保存容量 ' + fmtMB(bytes) : '') + '</div></div>' +
+      driveCardHtml() +
       groups +
       (orphans.length ? '<div class="section-title">メニューにない種目の動画</div><div class="card vlist">' + orphans.map(videoItem).join('') + '</div>' : '');
   }
@@ -929,7 +1098,8 @@
       '<div class="vs-sec"><div class="vs-head"><b>📱 スマホの動画</b><span class="muted small">この端末だけ ・ 圏外でもOK</span></div>' +
       (local ? '<div class="row" style="margin-top:8px"><span class="grow small" style="color:var(--good)">✓ 保存済み（' + fmtMB(localVideos[name]) + '）</span><button class="btn danger sm" data-act="vs-local-del">削除</button></div>' : '') +
       '<label class="btn ' + (local ? '' : 'primary ') + 'block file-btn" style="margin-top:10px">' + (local ? '別の動画に入れ替える' : '📁 動画を選んで保存') +
-      '<input class="file-hidden" type="file" accept="video/*,image/gif,image/webp" data-vsfile></label></div>' +
+      '<input class="file-hidden" type="file" accept="video/*,image/gif,image/webp" data-vsfile></label>' +
+      '<div class="vs-backup" id="vsBackup">' + backupLineHtml(name) + '</div></div>' +
       '<div class="vs-sec"><div class="vs-head"><b>🔗 YouTubeなどのリンク</b><span class="muted small">すべての端末で使える</span></div>' +
       (inMenu
         ? '<input class="input" id="vsUrl" type="url" inputmode="url" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="https://youtu.be/…" value="' + esc(url) + '" style="margin-top:8px">' +
@@ -1527,6 +1697,10 @@
       state.tab = 'home';
       render();
       toast('接続しました');
+      vdbLoad().then(driveRefresh).then(function () {
+        var n = drive.list ? Object.keys(drive.list).filter(function (k) { return !hasLocal(k); }).length : 0;
+        if (n) toast('ドライブに動画のバックアップが ' + n + '本あります。「動画」タブから戻せます');
+      });
     }, function (e) {
       state.conn = prev;
       btn.disabled = false;
@@ -1570,7 +1744,10 @@
 
   // ---- 操作 ----
   var actions = {
-    tab: function (el) { closeSheet(); state.tab = el.getAttribute('data-tab'); state.openSession = null; render(); window.scrollTo(0, 0); },
+    tab: function (el) {
+      closeSheet(); state.tab = el.getAttribute('data-tab'); state.openSession = null; render(); window.scrollTo(0, 0);
+      if (state.tab === 'videos') driveRefresh();
+    },
     settings: settingsSheet,
     'sheet-close': function () { if (hold) { finishHold(false); return; } closeSheet(); },
     'sync-now': function () { if (state.conn && !state.conn.demo) flush(); },
@@ -1664,7 +1841,22 @@
     'vs-local-del': function () {
       var name = vsName;
       if (!confirm('「' + name + '」に保存したスマホの動画を削除しますか？')) return;
-      vdbDel(name).then(function () { toast('削除しました'); afterVideoChange(name); }, function (e) { toast(e.message, true); });
+      var alsoDrive = onDrive(name) && confirm('Googleドライブのバックアップも削除しますか？\n（「キャンセル」なら残すので、あとで戻せます）');
+      vdbDel(name).then(function () {
+        if (!alsoDrive) return null;
+        return api('videoDelete', { name: name }).then(function () { delete drive.list[name]; });
+      }).then(function () { toast('削除しました'); afterVideoChange(name); }, function (e) { toast(driveErrorText(e), true); afterVideoChange(name); });
+    },
+    'vs-backup': function () { delete jobs[vsName]; queueJob(vsName, 'up'); },
+    'vs-restore': function () { delete jobs[vsName]; queueJob(vsName, 'down'); },
+    'drive-backup-all': function () { Object.keys(localVideos).forEach(function (n) { if (!isBackedUp(n)) { delete jobs[n]; queueJob(n, 'up'); } }); },
+    'drive-restore-all': function () { Object.keys(drive.list || {}).forEach(function (n) { if (!hasLocal(n)) { delete jobs[n]; queueJob(n, 'down'); } }); },
+    'drive-refresh': function () { drive.error = ''; render(); driveRefresh(); },
+    'set-autobackup': function (el) {
+      state.settings.autoBackup = el.getAttribute('data-v') === '1';
+      save(LS.settings, state.settings);
+      render();
+      if (state.settings.autoBackup) driveRefresh();
     },
     'ex-add': function () { syncEditorFields(); editing.exercises.push(ex('', 'bodyweight', 3, 10, 0, 60)); renderExList(); var c = document.querySelectorAll('#exList input[data-f="name"]'); c[c.length - 1].focus(); },
     'ex-del': function (el) {
@@ -1920,6 +2112,8 @@
     label.firstChild.textContent = '保存中…';
     makeThumb(f).then(function (thumb) { return vdbPut(name, f, thumb); }).then(function () {
       toast('「' + name + '」に動画を保存しました');
+      delete jobs[name];
+      if (state.settings.autoBackup) queueJob(name, 'up');
       afterVideoChange(name);
     }, function (e) {
       toast(e.message, true);
@@ -1943,7 +2137,7 @@
 
   // ---- 起動 ----
   render();
-  vdbLoad();
+  vdbLoad().then(driveRefresh);
   if (state.conn && !state.conn.demo) flush();
   if (draft && state.conn) openWorkout();
 
