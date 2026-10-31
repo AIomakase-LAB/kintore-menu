@@ -2,7 +2,7 @@
 (function () {
   'use strict';
 
-  var VERSION = '1.3.0';
+  var VERSION = '1.4.0';
   var LS = { conn: 'km.conn', data: 'km.data', outbox: 'km.outbox', draft: 'km.draft', settings: 'km.settings', demo: 'km.demo', ivl: 'km.ivl' };
   var WD = ['日', '月', '火', '水', '木', '金', '土'];
   var KIND_LABEL = { weight: '重量', bodyweight: '自重', time: '時間' };
@@ -114,6 +114,7 @@
   // ---- 端末内の動画（IndexedDB）: 手持ちの動画ファイルをこの端末にだけ保存して再生する ----
   var MAX_LOCAL_BYTES = 150 * 1024 * 1024;
   var localVideos = {};   // 種目名 -> サイズ(bytes)
+  var localThumbs = {};   // 種目名 -> サムネイル(data URL)
   var vdbPromise = null;
   function vdb() {
     if (!vdbPromise) {
@@ -139,33 +140,79 @@
   }
   function hasLocal(name) { return Object.prototype.hasOwnProperty.call(localVideos, name); }
   function vdbGet(name) { return vdbTx('readonly', function (st) { return st.get(name); }); }
-  function vdbPut(name, blob) {
-    return vdbTx('readwrite', function (st) { return st.put({ name: name, blob: blob, type: blob.type, size: blob.size, savedAt: Date.now() }); })
+  function vdbPut(name, blob, thumb) {
+    return vdbTx('readwrite', function (st) { return st.put({ name: name, blob: blob, type: blob.type, size: blob.size, thumb: thumb || null, savedAt: Date.now() }); })
       .then(function () {
         localVideos[name] = blob.size;
+        if (thumb) localThumbs[name] = thumb; else delete localThumbs[name];
         if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(function () {});
       });
   }
-  function vdbDel(name) { return vdbTx('readwrite', function (st) { return st.delete(name); }).then(function () { delete localVideos[name]; }); }
-  function vdbClear() { return vdbTx('readwrite', function (st) { return st.clear(); }).then(function () { localVideos = {}; }); }
+  function vdbDel(name) { return vdbTx('readwrite', function (st) { return st.delete(name); }).then(function () { delete localVideos[name]; delete localThumbs[name]; }); }
+  function vdbClear() { return vdbTx('readwrite', function (st) { return st.clear(); }).then(function () { localVideos = {}; localThumbs = {}; }); }
   function vdbLoad() {
     return vdbTx('readonly', function (st) { return st.getAll(); }).then(function (all) {
-      localVideos = {};
-      (all || []).forEach(function (v) { localVideos[v.name] = v.size; });
+      localVideos = {}; localThumbs = {};
+      var missing = [];
+      (all || []).forEach(function (v) {
+        localVideos[v.name] = v.size;
+        if (v.thumb) localThumbs[v.name] = v.thumb; else missing.push(v);
+      });
+      if (state.tab === 'videos') render();
+      // 旧バージョンで保存した動画にはサムネイルがないので、あとから作って保存し直す
+      missing.reduce(function (chain, v) {
+        return chain.then(function () {
+          return makeThumb(v.blob).then(function (t) {
+            if (!t) return null;
+            return vdbPut(v.name, v.blob, t).then(function () { if (state.tab === 'videos') render(); });
+          });
+        });
+      }, Promise.resolve()).catch(function () {});
     }).catch(function () { /* 使えない環境では URL の動画だけ使う */ });
+  }
+
+  /** 動画・画像から一覧用の小さなサムネイルを作る。作れない形式や時間切れのときは null。 */
+  function makeThumb(blob) {
+    return new Promise(function (res) {
+      var url = URL.createObjectURL(blob), done = false;
+      function fin(v) { if (done) return; done = true; URL.revokeObjectURL(url); res(v); }
+      function draw(src, w, h) {
+        try {
+          if (!w || !h) { fin(null); return; }
+          var k = 160 / Math.max(w, h), c = document.createElement('canvas');
+          c.width = Math.round(w * k); c.height = Math.round(h * k);
+          c.getContext('2d').drawImage(src, 0, 0, c.width, c.height);
+          fin(c.toDataURL('image/jpeg', 0.7));
+        } catch (e) { fin(null); }
+      }
+      setTimeout(function () { fin(null); }, 6000);
+      if (/^image\//.test(blob.type)) {
+        var img = new Image();
+        img.onload = function () { draw(img, img.naturalWidth, img.naturalHeight); };
+        img.onerror = function () { fin(null); };
+        img.src = url;
+        return;
+      }
+      var v = document.createElement('video');
+      v.muted = true; v.playsInline = true; v.preload = 'auto';
+      v.setAttribute('muted', ''); v.setAttribute('playsinline', '');
+      v.onloadeddata = function () { v.currentTime = Math.min(0.5, (v.duration || 1) / 3); };
+      v.onseeked = function () { draw(v, v.videoWidth, v.videoHeight); };
+      v.onerror = function () { fin(null); };
+      v.src = url;
+      v.load();
+    });
   }
   function fmtMB(b) { return b < 1048576 ? Math.max(1, Math.round(b / 1024)) + 'KB' : (b / 1048576).toFixed(b < 10485760 ? 1 : 0) + 'MB'; }
   function dropVid(node) { if (node._revoke) URL.revokeObjectURL(node._revoke); node.remove(); }
 
-  /** 保存時に、選んだファイルの書き込み・削除・種目名変更に伴う引っ越しをまとめて行う。 */
+  /** メニュー保存時、種目名を変えた種目の端末内の動画を新しい名前にも引き継ぐ。 */
   function applyLocalVideos(ops) {
     var chain = Promise.resolve();
     ops.forEach(function (o) {
       chain = chain.then(function () {
-        if (o.file) return vdbPut(o.name, o.file);
-        if (o.clear) return hasLocal(o.orig || o.name) ? vdbDel(o.orig || o.name) : null;
         if (o.orig && o.orig !== o.name && hasLocal(o.orig) && !hasLocal(o.name)) {
-          return vdbGet(o.orig).then(function (rec) { return rec ? vdbPut(o.name, rec.blob) : null; });
+          return vdbGet(o.orig).then(function (rec) { return rec ? vdbPut(o.name, rec.blob, rec.thumb) : null; });
         }
         return null;
       });
@@ -464,7 +511,7 @@
     if (!state.conn) { renderSetup(); return; }
     $('#tabbar').hidden = false;
     var v = $('#view');
-    var html = state.tab === 'home' ? viewHome() : state.tab === 'menus' ? viewMenus() : state.tab === 'history' ? viewHistory() : viewStats();
+    var html = state.tab === 'home' ? viewHome() : state.tab === 'menus' ? viewMenus() : state.tab === 'videos' ? viewVideos() : state.tab === 'history' ? viewHistory() : viewStats();
     v.innerHTML = html;
     Array.prototype.forEach.call($('#tabbar').children, function (b) {
       b.classList.toggle('active', b.getAttribute('data-tab') === state.tab);
@@ -777,6 +824,8 @@
   }
   function closeSheet() {
     var layer = $('#layer');
+    Array.prototype.forEach.call(layer.querySelectorAll('.sheet .vid'), dropVid);
+    vsName = null;
     Array.prototype.forEach.call(layer.querySelectorAll('.backdrop, .sheet'), function (n) { n.remove(); });
   }
 
@@ -819,7 +868,123 @@
     var names = Object.keys(localVideos), total = names.reduce(function (a, n) { return a + localVideos[n]; }, 0);
     return '<div class="section-title">端末内の動画</div><div class="card row"><div class="grow"><b>' + names.length + '本' + (names.length ? ' ・ ' + fmtMB(total) : '') + '</b>' +
       '<div class="muted small">この端末にだけ保存されます（他の端末には届きません）</div></div>' +
+      '<button class="btn sm" data-act="tab" data-tab="videos">管理</button>' +
       (names.length ? '<button class="btn danger sm" data-act="vdb-clear">すべて削除</button>' : '') + '</div>';
+  }
+
+  // ---- 動画タブ ----
+  function menusWith(name) {
+    return state.data.menus.filter(function (m) { return m.exercises.some(function (e) { return e.name === name; }); });
+  }
+  function urlFor(name) {
+    for (var i = 0; i < state.data.menus.length; i++) {
+      var exs = state.data.menus[i].exercises;
+      for (var j = 0; j < exs.length; j++) if (exs[j].name === name && exs[j].video) return exs[j].video;
+    }
+    return '';
+  }
+
+  function videoItem(name) {
+    var v = parseVideo(urlFor(name)), link = !!v && !v.error, local = hasLocal(name);
+    var bg = local && localThumbs[name] ? localThumbs[name] : link && v.type === 'youtube' ? 'https://i.ytimg.com/vi/' + v.id + '/mqdefault.jpg' : '';
+    var tags = (local ? '<span class="pill local">📱 スマホの動画 ' + fmtMB(localVideos[name]) + '</span>' : '') +
+      (link ? '<span class="pill link">🔗 ' + (v.type === 'youtube' ? 'YouTube' : 'リンク') + '</span>' : '');
+    return '<button class="vlist-item" data-act="vs-open" data-name="' + esc(name) + '">' +
+      '<span class="thumb' + (local || link ? ' has' : '') + '"' + (bg ? ' style="background-image:url(' + bg + ')"' : '') + '>' + (bg ? '' : local || link ? '🎬' : '＋') + '</span>' +
+      '<div class="grow"><b>' + esc(name) + '</b><div class="tags">' + (tags || '<span class="muted small">未設定 ・ タップして追加</span>') + '</div></div>' +
+      '<span class="muted chev">›</span></button>';
+  }
+
+  function viewVideos() {
+    var seen = {}, total = 0, withVideo = 0, groups = '';
+    state.data.menus.forEach(function (m) {
+      var names = [];
+      m.exercises.forEach(function (e) { if (names.indexOf(e.name) < 0) names.push(e.name); });
+      names.forEach(function (n) {
+        if (seen[n]) return;
+        seen[n] = 1; total++;
+        var v = parseVideo(urlFor(n));
+        if (hasLocal(n) || (v && !v.error)) withVideo++;
+      });
+      groups += '<div class="section-title">' + esc(m.name) + '</div><div class="card vlist">' + names.map(videoItem).join('') + '</div>';
+    });
+    var orphans = Object.keys(localVideos).filter(function (n) { return !seen[n]; });
+    var bytes = Object.keys(localVideos).reduce(function (a, n) { return a + localVideos[n]; }, 0);
+    var head = '<div class="page-head"><div><div class="eyebrow">フォーム動画</div><h1>動画</h1></div></div>';
+    if (!state.data.menus.length) return head + '<div class="card empty-state"><div class="ico">🎬</div>先に「メニュー」タブでメニューを作ると、種目ごとに動画を登録できます。</div>';
+    return head +
+      '<div class="card vguide"><div class="row"><span class="vg-ico">📱</span><div class="grow"><b>スマホの動画</b><div class="muted small">撮った動画やGIFを保存。圏外でも再生できます（この端末だけ）</div></div></div>' +
+      '<div class="row"><span class="vg-ico">🔗</span><div class="grow"><b>YouTubeなどのリンク</b><div class="muted small">リンクを貼るだけ。すべての端末で使えます</div></div></div>' +
+      '<div class="vg-sum tnum">動画あり <b>' + withVideo + '</b> / ' + total + '種目' + (bytes ? ' ・ 保存容量 ' + fmtMB(bytes) : '') + '</div></div>' +
+      groups +
+      (orphans.length ? '<div class="section-title">メニューにない種目の動画</div><div class="card vlist">' + orphans.map(videoItem).join('') + '</div>' : '');
+  }
+
+  var vsName = null;
+  function videoSheet(name) {
+    var url = urlFor(name), v = parseVideo(url), link = !!v && !v.error, local = hasLocal(name), inMenu = menusWith(name).length > 0;
+    openSheet('<h3>' + esc(name) + '</h3><div class="muted small">フォーム動画</div>' +
+      '<div class="vs-preview" id="vsPreview">' + (local || link ? '<div class="vs-empty">読み込み中…</div>' : '<div class="vs-empty">まだ動画がありません<br><span class="small">下のどちらかで追加してください</span></div>') + '</div>' +
+      (local && link ? '<div class="muted small" style="margin-top:6px">両方あるときは「スマホの動画」を再生します</div>' : '') +
+      '<div class="vs-sec"><div class="vs-head"><b>📱 スマホの動画</b><span class="muted small">この端末だけ ・ 圏外でもOK</span></div>' +
+      (local ? '<div class="row" style="margin-top:8px"><span class="grow small" style="color:var(--good)">✓ 保存済み（' + fmtMB(localVideos[name]) + '）</span><button class="btn danger sm" data-act="vs-local-del">削除</button></div>' : '') +
+      '<label class="btn ' + (local ? '' : 'primary ') + 'block file-btn" style="margin-top:10px">' + (local ? '別の動画に入れ替える' : '📁 動画を選んで保存') +
+      '<input class="file-hidden" type="file" accept="video/*,image/gif,image/webp" data-vsfile></label></div>' +
+      '<div class="vs-sec"><div class="vs-head"><b>🔗 YouTubeなどのリンク</b><span class="muted small">すべての端末で使える</span></div>' +
+      (inMenu
+        ? '<input class="input" id="vsUrl" type="url" inputmode="url" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="https://youtu.be/…" value="' + esc(url) + '" style="margin-top:8px">' +
+          '<div class="small" id="vsState" style="margin:6px 2px 0">' + videoStateHtml(url) + '</div>' +
+          '<div class="row" style="margin-top:10px;flex-wrap:wrap"><button class="btn sm" data-act="vs-paste">貼り付け</button><button class="btn sm" data-act="vs-find">YouTubeで探す</button><span class="grow"></span>' +
+          (url ? '<button class="btn danger sm" data-act="vs-url-del">削除</button>' : '') + '</div>' +
+          '<button class="btn primary block" style="margin-top:10px" data-act="vs-url-save">リンクを保存</button>'
+        : '<div class="muted small" style="margin-top:8px">メニューにない種目なので、リンクは登録できません</div>') + '</div>' +
+      '<div class="foot"><button class="btn block lg" data-act="sheet-close">閉じる</button></div>');
+    vsName = name;
+    var box = $('#vsPreview');
+    var put = function (node) {
+      if (vsName !== name || !document.body.contains(box)) { dropVid(node); return; }
+      box.innerHTML = ''; box.appendChild(node);
+    };
+    if (local) {
+      vdbGet(name).then(function (rec) {
+        if (!rec) return;
+        var u = URL.createObjectURL(rec.blob), node = videoNode({ type: /^image\//.test(rec.type) ? 'image' : 'video', src: u });
+        node._revoke = u;
+        put(node);
+      });
+    } else if (link) put(videoNode(v));
+  }
+
+  /** リンクは、その種目を含むすべてのメニューに書き込む（同じ種目名なら同じ動画）。 */
+  function setUrlFor(name, url) {
+    var ms = menusWith(name);
+    if (!ms.length) { toast('メニューにない種目です', true); return; }
+    ms.forEach(function (m) {
+      saveMenu({ id: m.id, name: m.name, order: m.order, exercises: m.exercises.map(function (e) {
+        return e.name === name ? Object.assign({}, e, { video: url }) : e;
+      }) });
+    });
+    toast(url ? 'リンクを保存しました' : 'リンクを削除しました');
+    afterVideoChange(name);
+  }
+
+  function afterVideoChange(name) {
+    render();
+    if (draft) {
+      var url = urlFor(name);
+      draft.exercises.forEach(function (e, i) {
+        if (e.name !== name) return;
+        e.video = url;
+        var card = document.querySelector('.workout .ex-card[data-ei="' + i + '"]');
+        if (!card) return;
+        var old = card.querySelector('.vid');
+        if (old) dropVid(old);
+        openVid[i] = false;
+        rerenderExCard(i);
+      });
+      saveDraft();
+    }
+    if ($('.sheet') && vsName === name) videoSheet(name);
   }
 
   // ---- メニュー編集 ----
@@ -851,17 +1016,13 @@
         '<div class="grid3" style="margin-top:10px;grid-template-columns:repeat(' + (isW ? 4 : 3) + ',1fr)">' +
         mini('セット', 'sets', e.sets, 'numeric') + mini(e.kind === 'time' ? '秒' : '回数', 'reps', e.reps, 'numeric') +
         (isW ? mini('重さkg', 'weight', e.weight, 'decimal') : '') + mini('休憩秒', 'rest', e.rest, 'numeric') + '</div>' +
-        '<div class="row" style="margin-top:10px"><input class="input grow" type="url" inputmode="url" data-f="video" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="フォーム動画のURL（YouTube・mp4・gif）" value="' + esc(e.video) + '">' +
-        '<button class="btn sm" data-act="ex-paste">貼付</button><button class="btn sm" data-act="ex-find">探す</button></div>' +
-        '<div class="vid-state small" data-vstate>' + videoStateHtml(e.video) + '</div>' +
-        '<div class="row" style="margin-top:8px"><label class="btn sm file-btn">📁 端末の動画を選ぶ<input class="file-hidden" type="file" accept="video/*,image/gif,image/webp" data-vfile></label>' + localStateHtml(e) + '</div></div>';
+        '<div class="vid-line small">' + editorVideoLine(e) + '</div></div>';
     }).join('');
   }
-  function localStateHtml(e) {
-    if (e._file) return '<span class="small grow" style="color:var(--good)">選択中：' + esc(e._file.name) + '（' + fmtMB(e._file.size) + '）</span><button class="btn danger sm" data-act="ex-localclear">取消</button>';
-    var key = e._orig || e.name;
-    if (!e._clearLocal && hasLocal(key)) return '<span class="small grow" style="color:var(--good)">✓ この端末に保存済み（' + fmtMB(localVideos[key]) + '）</span><button class="btn danger sm" data-act="ex-localdel">削除</button>';
-    return '<span class="small muted grow">この端末にだけ保存されます</span>';
+  function editorVideoLine(e) {
+    var v = parseVideo(e.video), link = !!v && !v.error, local = hasLocal(e._orig || e.name);
+    if (!local && !link) return '<span class="muted">🎬 動画なし ・ 保存後に「動画」タブで追加できます</span>';
+    return '<span style="color:var(--good)">🎬 動画あり（' + [local ? 'スマホの動画' : '', link ? 'リンク' : ''].filter(Boolean).join('・') + '）</span><span class="muted"> ・ 変更は「動画」タブで</span>';
   }
   function videoStateHtml(url) {
     var v = parseVideo(url);
@@ -965,7 +1126,8 @@
     var bestTxt = e.best ? (isW ? '推定1RM ' + fmtNum(e.best) + 'kg' : fmtNum(e.best) + (e.kind === 'time' ? '秒' : '回')) : '';
     var h = '<div class="ex-card' + (allDone ? ' done' : '') + '" data-ei="' + ei + '"><div class="row"><div class="grow"><h4>' + esc(e.name) + '</h4>' +
       '<div class="sub">目標 ' + tgt + (bestTxt ? ' ・ ベスト ' + bestTxt : '') + ' ・ 休憩' + e.rest + '秒</div></div><span class="pill">' + KIND_LABEL[e.kind] + '</span></div>' +
-      (hasVideo(e) ? '<button class="vid-toggle" data-act="w-video">' + (openVid[ei] ? '■ 動画を閉じる' : '▶ フォーム動画を見る（ループ再生）') + '</button>' : '') +
+      (hasVideo(e) ? '<button class="vid-toggle" data-act="w-video">' + (openVid[ei] ? '■ 動画を閉じる' : '▶ フォーム動画を見る（ループ再生）') + '</button>'
+        : '<button class="vid-toggle add" data-act="w-video-add">＋ フォーム動画を追加</button>') +
       '<div class="set-head' + (isW ? '' : ' no-w') + '"><span>SET</span>' + (isW ? '<span>KG</span>' : '') + '<span>' + (e.kind === 'time' ? '秒' : '回') + '</span><span></span></div>';
     e.sets.forEach(function (s, si) {
       var p = e.prev ? e.prev[si] : null;
@@ -1408,7 +1570,7 @@
 
   // ---- 操作 ----
   var actions = {
-    tab: function (el) { state.tab = el.getAttribute('data-tab'); state.openSession = null; render(); window.scrollTo(0, 0); },
+    tab: function (el) { closeSheet(); state.tab = el.getAttribute('data-tab'); state.openSession = null; render(); window.scrollTo(0, 0); },
     settings: settingsSheet,
     'sheet-close': function () { if (hold) { finishHold(false); return; } closeSheet(); },
     'sync-now': function () { if (state.conn && !state.conn.demo) flush(); },
@@ -1471,33 +1633,38 @@
       saveMenu({ id: uid(), name: name, order: state.data.menus.length, exercises: JSON.parse(JSON.stringify(t.exercises)) });
       toast('「' + name + '」を追加しました');
     },
-    'ex-localclear': function (el) {
-      syncEditorFields();
-      delete editing.exercises[+el.closest('#exList > .card').getAttribute('data-i')]._file;
-      renderExList();
-    },
-    'ex-localdel': function (el) {
-      syncEditorFields();
-      editing.exercises[+el.closest('#exList > .card').getAttribute('data-i')]._clearLocal = true;
-      renderExList();
-    },
     'vdb-clear': function () {
       if (!confirm('この端末に保存した動画をすべて削除しますか？（メニューやURLの動画は残ります）')) return;
       vdbClear().then(function () { settingsSheet(); toast('削除しました'); }, function (e) { toast(e.message, true); });
     },
-    'ex-paste': function (el) {
-      var inp = el.closest('.row').querySelector('input');
+    // 動画タブ
+    'vs-open': function (el) { videoSheet(el.getAttribute('data-name')); },
+    'vs-paste': function () {
+      var inp = $('#vsUrl');
       var hint = function () { toast('入力欄を長押しして「ペースト」してください'); inp.focus(); };
       if (!navigator.clipboard || !navigator.clipboard.readText) { hint(); return; }
       navigator.clipboard.readText().then(function (t) {
         inp.value = String(t || '').trim();
-        inp.closest('.card').querySelector('[data-vstate]').innerHTML = videoStateHtml(inp.value);
+        $('#vsState').innerHTML = videoStateHtml(inp.value);
       }, hint);
     },
-    'ex-find': function (el) {
-      var card = el.closest('.card'), name = card.querySelector('input[data-f="name"]').value.trim();
-      if (!name) { toast('先に種目名を入力してください', true); return; }
-      window.open('https://www.youtube.com/results?search_query=' + encodeURIComponent(name + ' やり方 フォーム'), '_blank', 'noopener');
+    'vs-find': function () {
+      window.open('https://www.youtube.com/results?search_query=' + encodeURIComponent(vsName + ' やり方 フォーム'), '_blank', 'noopener');
+    },
+    'vs-url-save': function () {
+      var url = $('#vsUrl').value.trim(), v = parseVideo(url);
+      if (!v) { toast('リンクを貼り付けてください', true); return; }
+      if (v.error) { toast(v.error, true); return; }
+      setUrlFor(vsName, url);
+    },
+    'vs-url-del': function () {
+      if (!confirm('「' + vsName + '」のリンクを削除しますか？')) return;
+      setUrlFor(vsName, '');
+    },
+    'vs-local-del': function () {
+      var name = vsName;
+      if (!confirm('「' + name + '」に保存したスマホの動画を削除しますか？')) return;
+      vdbDel(name).then(function () { toast('削除しました'); afterVideoChange(name); }, function (e) { toast(e.message, true); });
     },
     'ex-add': function () { syncEditorFields(); editing.exercises.push(ex('', 'bodyweight', 3, 10, 0, 60)); renderExList(); var c = document.querySelectorAll('#exList input[data-f="name"]'); c[c.length - 1].focus(); },
     'ex-del': function (el) {
@@ -1522,13 +1689,9 @@
       var m = editing;
       m.name = String(m.name || '').trim();
       var ops = m.exercises.filter(function (e) { return String(e.name).trim(); }).map(function (e) {
-        return { name: String(e.name).trim(), orig: e._orig, file: e._file, clear: e._clearLocal };
+        return { name: String(e.name).trim(), orig: e._orig };
       });
       m.exercises = cleanExercises(m.exercises);
-      for (var vi = 0; vi < m.exercises.length; vi++) {
-        var pv = parseVideo(m.exercises[vi].video);
-        if (pv && pv.error) { toast('「' + m.exercises[vi].name + '」の動画：' + pv.error, true); return; }
-      }
       if (!m.name) { toast('メニュー名を入力してください', true); return; }
       if (!m.exercises.length) { toast('種目名を入力してください', true); return; }
       if (!m.id) { m.id = uid(); m.order = state.data.menus.length; }
@@ -1664,6 +1827,7 @@
         place(node);
       }, function () { el.disabled = false; fromUrl(); });
     },
+    'w-video-add': function (el) { videoSheet(draft.exercises[+el.closest('[data-ei]').getAttribute('data-ei')].name); },
     'w-hold': function (el) {
       startHold(+el.closest('[data-ei]').getAttribute('data-ei'), +el.closest('[data-si]').getAttribute('data-si'));
     },
@@ -1741,20 +1905,26 @@
     }
   });
   document.addEventListener('input', function (ev) {
-    var t = ev.target;
-    if (t.matches && t.matches('#exList input[data-f="video"]')) t.closest('.card').querySelector('[data-vstate]').innerHTML = videoStateHtml(t.value);
+    if (ev.target.id === 'vsUrl') $('#vsState').innerHTML = videoStateHtml(ev.target.value);
   });
+  // 動画タブ: スマホの動画を選んだらその場で保存する
   document.addEventListener('change', function (ev) {
     var t = ev.target;
-    if (!(t.matches && t.matches('#exList input[data-vfile]'))) return;
-    var f = t.files && t.files[0];
-    if (!f) return;
+    if (!(t.matches && t.matches('input[data-vsfile]'))) return;
+    var f = t.files && t.files[0], name = vsName;
+    if (!f || !name) return;
     if (f.size > MAX_LOCAL_BYTES) { toast('ファイルが大きすぎます（' + fmtMB(MAX_LOCAL_BYTES) + 'まで）。短く切り出してください', true); t.value = ''; return; }
     if (!/^(video|image)\//.test(f.type)) { toast('動画または画像ファイルを選んでください', true); t.value = ''; return; }
-    syncEditorFields();
-    var e = editing.exercises[+t.closest('#exList > .card').getAttribute('data-i')];
-    e._file = f; e._clearLocal = false;
-    renderExList();
+    var label = t.closest('label');
+    label.classList.add('busy');
+    label.firstChild.textContent = '保存中…';
+    makeThumb(f).then(function (thumb) { return vdbPut(name, f, thumb); }).then(function () {
+      toast('「' + name + '」に動画を保存しました');
+      afterVideoChange(name);
+    }, function (e) {
+      toast(e.message, true);
+      if (vsName === name) videoSheet(name);
+    });
   });
   document.addEventListener('focusin', function (ev) {
     if (ev.target.matches('.stepper input')) setTimeout(function () { ev.target.select(); }, 0);
