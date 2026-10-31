@@ -2,7 +2,7 @@
 (function () {
   'use strict';
 
-  var VERSION = '1.2.0';
+  var VERSION = '1.3.0';
   var LS = { conn: 'km.conn', data: 'km.data', outbox: 'km.outbox', draft: 'km.draft', settings: 'km.settings', demo: 'km.demo', ivl: 'km.ivl' };
   var WD = ['日', '月', '火', '水', '木', '金', '土'];
   var KIND_LABEL = { weight: '重量', bodyweight: '自重', time: '時間' };
@@ -110,6 +110,68 @@
     return box;
   }
   var openVid = {};
+
+  // ---- 端末内の動画（IndexedDB）: 手持ちの動画ファイルをこの端末にだけ保存して再生する ----
+  var MAX_LOCAL_BYTES = 150 * 1024 * 1024;
+  var localVideos = {};   // 種目名 -> サイズ(bytes)
+  var vdbPromise = null;
+  function vdb() {
+    if (!vdbPromise) {
+      vdbPromise = new Promise(function (res, rej) {
+        if (!window.indexedDB) { rej(new Error('このブラウザでは端末内に保存できません')); return; }
+        var r = indexedDB.open('kintore', 1);
+        r.onupgradeneeded = function () { r.result.createObjectStore('videos', { keyPath: 'name' }); };
+        r.onsuccess = function () { res(r.result); };
+        r.onerror = function () { rej(r.error || new Error('保存領域を開けませんでした')); };
+      });
+      vdbPromise.catch(function () { vdbPromise = null; });
+    }
+    return vdbPromise;
+  }
+  function vdbTx(mode, fn) {
+    return vdb().then(function (db) {
+      return new Promise(function (res, rej) {
+        var tx = db.transaction('videos', mode), req = fn(tx.objectStore('videos'));
+        tx.oncomplete = function () { res(req ? req.result : undefined); };
+        tx.onabort = tx.onerror = function () { rej(tx.error || new Error('保存に失敗しました（容量不足の可能性があります）')); };
+      });
+    });
+  }
+  function hasLocal(name) { return Object.prototype.hasOwnProperty.call(localVideos, name); }
+  function vdbGet(name) { return vdbTx('readonly', function (st) { return st.get(name); }); }
+  function vdbPut(name, blob) {
+    return vdbTx('readwrite', function (st) { return st.put({ name: name, blob: blob, type: blob.type, size: blob.size, savedAt: Date.now() }); })
+      .then(function () {
+        localVideos[name] = blob.size;
+        if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(function () {});
+      });
+  }
+  function vdbDel(name) { return vdbTx('readwrite', function (st) { return st.delete(name); }).then(function () { delete localVideos[name]; }); }
+  function vdbClear() { return vdbTx('readwrite', function (st) { return st.clear(); }).then(function () { localVideos = {}; }); }
+  function vdbLoad() {
+    return vdbTx('readonly', function (st) { return st.getAll(); }).then(function (all) {
+      localVideos = {};
+      (all || []).forEach(function (v) { localVideos[v.name] = v.size; });
+    }).catch(function () { /* 使えない環境では URL の動画だけ使う */ });
+  }
+  function fmtMB(b) { return b < 1048576 ? Math.max(1, Math.round(b / 1024)) + 'KB' : (b / 1048576).toFixed(b < 10485760 ? 1 : 0) + 'MB'; }
+  function dropVid(node) { if (node._revoke) URL.revokeObjectURL(node._revoke); node.remove(); }
+
+  /** 保存時に、選んだファイルの書き込み・削除・種目名変更に伴う引っ越しをまとめて行う。 */
+  function applyLocalVideos(ops) {
+    var chain = Promise.resolve();
+    ops.forEach(function (o) {
+      chain = chain.then(function () {
+        if (o.file) return vdbPut(o.name, o.file);
+        if (o.clear) return hasLocal(o.orig || o.name) ? vdbDel(o.orig || o.name) : null;
+        if (o.orig && o.orig !== o.name && hasLocal(o.orig) && !hasLocal(o.name)) {
+          return vdbGet(o.orig).then(function (rec) { return rec ? vdbPut(o.name, rec.blob) : null; });
+        }
+        return null;
+      });
+    });
+    return chain;
+  }
 
   // ---- 小物 ----
   var $ = function (sel, root) { return (root || document).querySelector(sel); };
@@ -746,16 +808,25 @@
         return '<button data-act="set-step" data-v="' + n + '" class="' + (s.weightStep === n ? 'on' : '') + '">' + n + 'kg</button>';
       }).join('') + '</div></div>' +
       '<div class="field"><span>休憩・タイマー終了の音</span><div class="seg"><button data-act="set-sound" data-v="1" class="' + (s.sound ? 'on' : '') + '">鳴らす</button><button data-act="set-sound" data-v="0" class="' + (!s.sound ? 'on' : '') + '">鳴らさない</button></div></div>' +
+      localVideoSettingHtml() +
       '<div class="section-title">接続</div><div class="card"><div class="row"><div class="grow"><b>' + host + '</b><div class="muted small">未送信 ' + state.outbox.length + ' 件</div></div>' +
       (c.demo ? '' : '<button class="btn sm" data-act="sync-now">今すぐ同期</button>') + '</div></div>' +
       '<div class="foot"><button class="btn danger block" data-act="disconnect">' + (c.demo ? 'デモを終了' : '接続コードを入れ直す') + '</button></div>' +
       '<p class="muted small center" style="margin-top:16px">筋トレメニュー v' + VERSION + '</p>');
   }
 
+  function localVideoSettingHtml() {
+    var names = Object.keys(localVideos), total = names.reduce(function (a, n) { return a + localVideos[n]; }, 0);
+    return '<div class="section-title">端末内の動画</div><div class="card row"><div class="grow"><b>' + names.length + '本' + (names.length ? ' ・ ' + fmtMB(total) : '') + '</b>' +
+      '<div class="muted small">この端末にだけ保存されます（他の端末には届きません）</div></div>' +
+      (names.length ? '<button class="btn danger sm" data-act="vdb-clear">すべて削除</button>' : '') + '</div>';
+  }
+
   // ---- メニュー編集 ----
   var editing = null;
   function menuEditor(menu) {
     editing = JSON.parse(JSON.stringify(menu));
+    editing.exercises.forEach(function (e) { e._orig = e.name; });
     openSheet('<h3>' + (menu.id ? 'メニューを編集' : '新しいメニュー') + '</h3>' +
       '<label class="field"><span>メニュー名</span><input class="input" id="mName" value="' + esc(menu.name) + '" placeholder="例：胸と背中の日"></label>' +
       '<div class="section-title" style="margin-top:20px">種目</div><div id="exList" class="stack"></div>' +
@@ -782,8 +853,15 @@
         (isW ? mini('重さkg', 'weight', e.weight, 'decimal') : '') + mini('休憩秒', 'rest', e.rest, 'numeric') + '</div>' +
         '<div class="row" style="margin-top:10px"><input class="input grow" type="url" inputmode="url" data-f="video" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="フォーム動画のURL（YouTube・mp4・gif）" value="' + esc(e.video) + '">' +
         '<button class="btn sm" data-act="ex-paste">貼付</button><button class="btn sm" data-act="ex-find">探す</button></div>' +
-        '<div class="vid-state small" data-vstate>' + videoStateHtml(e.video) + '</div></div>';
+        '<div class="vid-state small" data-vstate>' + videoStateHtml(e.video) + '</div>' +
+        '<div class="row" style="margin-top:8px"><label class="btn sm file-btn">📁 端末の動画を選ぶ<input class="file-hidden" type="file" accept="video/*,image/gif,image/webp" data-vfile></label>' + localStateHtml(e) + '</div></div>';
     }).join('');
+  }
+  function localStateHtml(e) {
+    if (e._file) return '<span class="small grow" style="color:var(--good)">選択中：' + esc(e._file.name) + '（' + fmtMB(e._file.size) + '）</span><button class="btn danger sm" data-act="ex-localclear">取消</button>';
+    var key = e._orig || e.name;
+    if (!e._clearLocal && hasLocal(key)) return '<span class="small grow" style="color:var(--good)">✓ この端末に保存済み（' + fmtMB(localVideos[key]) + '）</span><button class="btn danger sm" data-act="ex-localdel">削除</button>';
+    return '<span class="small muted grow">この端末にだけ保存されます</span>';
   }
   function videoStateHtml(url) {
     var v = parseVideo(url);
@@ -860,7 +938,7 @@
 
   function closeWorkout() {
     var w = $('.workout');
-    if (w) w.remove();
+    if (w) { Array.prototype.forEach.call(w.querySelectorAll('.vid'), dropVid); w.remove(); }
     document.body.style.overflow = '';
     clearInterval(tick);
     releaseWake();
@@ -909,7 +987,7 @@
       '<button data-act="w-step" data-f="' + f + '" data-d="1" aria-label="増やす">＋</button></div>';
   }
 
-  function hasVideo(e) { var v = parseVideo(e.video); return !!v && !v.error; }
+  function hasVideo(e) { var v = parseVideo(e.video); return hasLocal(e.name) || (!!v && !v.error); }
 
   /** セット完了などでカードを描き直しても、再生中の動画は同じ要素のまま残して頭出しに戻さない。 */
   function rerenderExCard(ei) {
@@ -1393,6 +1471,20 @@
       saveMenu({ id: uid(), name: name, order: state.data.menus.length, exercises: JSON.parse(JSON.stringify(t.exercises)) });
       toast('「' + name + '」を追加しました');
     },
+    'ex-localclear': function (el) {
+      syncEditorFields();
+      delete editing.exercises[+el.closest('#exList > .card').getAttribute('data-i')]._file;
+      renderExList();
+    },
+    'ex-localdel': function (el) {
+      syncEditorFields();
+      editing.exercises[+el.closest('#exList > .card').getAttribute('data-i')]._clearLocal = true;
+      renderExList();
+    },
+    'vdb-clear': function () {
+      if (!confirm('この端末に保存した動画をすべて削除しますか？（メニューやURLの動画は残ります）')) return;
+      vdbClear().then(function () { settingsSheet(); toast('削除しました'); }, function (e) { toast(e.message, true); });
+    },
     'ex-paste': function (el) {
       var inp = el.closest('.row').querySelector('input');
       var hint = function () { toast('入力欄を長押しして「ペースト」してください'); inp.focus(); };
@@ -1429,9 +1521,10 @@
       syncEditorFields();
       var m = editing;
       m.name = String(m.name || '').trim();
-      m.exercises = m.exercises.filter(function (e) { return String(e.name).trim(); }).map(function (e) {
-        return { name: String(e.name).trim(), kind: e.kind, sets: Math.max(1, +e.sets || 1), reps: Math.max(1, +e.reps || 1), weight: Math.max(0, +e.weight || 0), rest: Math.max(0, +e.rest || 0), video: String(e.video || '').trim() };
+      var ops = m.exercises.filter(function (e) { return String(e.name).trim(); }).map(function (e) {
+        return { name: String(e.name).trim(), orig: e._orig, file: e._file, clear: e._clearLocal };
       });
+      m.exercises = cleanExercises(m.exercises);
       for (var vi = 0; vi < m.exercises.length; vi++) {
         var pv = parseVideo(m.exercises[vi].video);
         if (pv && pv.error) { toast('「' + m.exercises[vi].name + '」の動画：' + pv.error, true); return; }
@@ -1439,13 +1532,15 @@
       if (!m.name) { toast('メニュー名を入力してください', true); return; }
       if (!m.exercises.length) { toast('種目名を入力してください', true); return; }
       if (!m.id) { m.id = uid(); m.order = state.data.menus.length; }
-      closeSheet();
-      saveMenu(m);
-      toast('保存しました');
+      applyLocalVideos(ops).then(function () {
+        closeSheet();
+        saveMenu(m);
+        toast('保存しました');
+      }, function (e) { toast(e.message, true); });
     },
     'menu-dup': function () {
       syncEditorFields();
-      var m = JSON.parse(JSON.stringify(editing));
+      var m = { name: editing.name, exercises: cleanExercises(editing.exercises) };
       m.id = uid(); m.name = m.name + ' のコピー'; m.order = state.data.menus.length;
       closeSheet(); saveMenu(m); toast('複製しました');
     },
@@ -1538,20 +1633,36 @@
     'w-video': function (el) {
       var card = el.closest('[data-ei]'), ei = +card.getAttribute('data-ei');
       if (card.querySelector('.vid')) {
-        card.querySelector('.vid').remove(); openVid[ei] = false;
+        dropVid(card.querySelector('.vid')); openVid[ei] = false;
         el.textContent = '▶ フォーム動画を見る（ループ再生）';
         return;
       }
-      var v = parseVideo(draft.exercises[ei].video);
-      if (!v || v.error) { toast('動画のURLを確認してください', true); return; }
-      // 同時に何本も読み込まないよう、ほかの動画は閉じる
-      Array.prototype.forEach.call(document.querySelectorAll('.workout .ex-card .vid'), function (n) {
-        var c = n.closest('[data-ei]'); n.remove(); openVid[+c.getAttribute('data-ei')] = false;
-        c.querySelector('.vid-toggle').textContent = '▶ フォーム動画を見る（ループ再生）';
-      });
-      el.after(videoNode(v));
-      openVid[ei] = true;
-      el.textContent = '■ 動画を閉じる';
+      var name = draft.exercises[ei].name, v = parseVideo(draft.exercises[ei].video);
+      var place = function (node) {
+        // 同時に何本も読み込まないよう、ほかの動画は閉じる
+        Array.prototype.forEach.call(document.querySelectorAll('.workout .ex-card .vid'), function (n) {
+          var c = n.closest('[data-ei]'); dropVid(n); openVid[+c.getAttribute('data-ei')] = false;
+          c.querySelector('.vid-toggle').textContent = '▶ フォーム動画を見る（ループ再生）';
+        });
+        el.after(node);
+        openVid[ei] = true;
+        el.textContent = '■ 動画を閉じる';
+      };
+      var fromUrl = function () {
+        if (!v || v.error) { toast('動画が見つかりません。メニューで登録し直してください', true); return; }
+        place(videoNode(v));
+      };
+      if (!hasLocal(name)) { fromUrl(); return; }
+      // 端末に保存した動画を優先（圏外でも見られる）
+      el.disabled = true;
+      vdbGet(name).then(function (rec) {
+        el.disabled = false;
+        if (!rec) { delete localVideos[name]; fromUrl(); return; }
+        var url = URL.createObjectURL(rec.blob);
+        var node = videoNode({ type: /^image\//.test(rec.type) ? 'image' : 'video', src: url });
+        node._revoke = url;
+        place(node);
+      }, function () { el.disabled = false; fromUrl(); });
     },
     'w-hold': function (el) {
       startHold(+el.closest('[data-ei]').getAttribute('data-ei'), +el.closest('[data-si]').getAttribute('data-si'));
@@ -1588,6 +1699,12 @@
       toast('記録を保存しました 💪');
     }
   };
+
+  function cleanExercises(list) {
+    return list.filter(function (e) { return String(e.name).trim(); }).map(function (e) {
+      return { name: String(e.name).trim(), kind: e.kind, sets: Math.max(1, +e.sets || 1), reps: Math.max(1, +e.reps || 1), weight: Math.max(0, +e.weight || 0), rest: Math.max(0, +e.rest || 0), video: String(e.video || '').trim() };
+    });
+  }
 
   function saveMenu(m) {
     mutate('saveMenu', m, function (d) {
@@ -1627,6 +1744,18 @@
     var t = ev.target;
     if (t.matches && t.matches('#exList input[data-f="video"]')) t.closest('.card').querySelector('[data-vstate]').innerHTML = videoStateHtml(t.value);
   });
+  document.addEventListener('change', function (ev) {
+    var t = ev.target;
+    if (!(t.matches && t.matches('#exList input[data-vfile]'))) return;
+    var f = t.files && t.files[0];
+    if (!f) return;
+    if (f.size > MAX_LOCAL_BYTES) { toast('ファイルが大きすぎます（' + fmtMB(MAX_LOCAL_BYTES) + 'まで）。短く切り出してください', true); t.value = ''; return; }
+    if (!/^(video|image)\//.test(f.type)) { toast('動画または画像ファイルを選んでください', true); t.value = ''; return; }
+    syncEditorFields();
+    var e = editing.exercises[+t.closest('#exList > .card').getAttribute('data-i')];
+    e._file = f; e._clearLocal = false;
+    renderExList();
+  });
   document.addEventListener('focusin', function (ev) {
     if (ev.target.matches('.stepper input')) setTimeout(function () { ev.target.select(); }, 0);
   });
@@ -1644,6 +1773,7 @@
 
   // ---- 起動 ----
   render();
+  vdbLoad();
   if (state.conn && !state.conn.demo) flush();
   if (draft && state.conn) openWorkout();
 
