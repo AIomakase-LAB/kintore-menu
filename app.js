@@ -2,7 +2,7 @@
 (function () {
   'use strict';
 
-  var VERSION = '1.1.0';
+  var VERSION = '1.2.0';
   var LS = { conn: 'km.conn', data: 'km.data', outbox: 'km.outbox', draft: 'km.draft', settings: 'km.settings', demo: 'km.demo', ivl: 'km.ivl' };
   var WD = ['日', '月', '火', '水', '木', '金', '土'];
   var KIND_LABEL = { weight: '重量', bodyweight: '自重', time: '時間' };
@@ -22,7 +22,7 @@
       ex('サイドプランク', 'time', 2, 30, 0, 30)] }
   ];
   function ex(name, kind, sets, reps, weight, rest) {
-    return { name: name, kind: kind, sets: sets, reps: reps, weight: weight, rest: rest };
+    return { name: name, kind: kind, sets: sets, reps: reps, weight: weight, rest: rest, video: '' };
   }
 
   // ---- 保存 ----
@@ -52,6 +52,64 @@
     return { menus: d.menus || [], sessions: d.sessions || [], body: d.body || [] };
   }
   function persistData() { save(LS.data, state.data); }
+
+  // ---- フォーム動画 ----
+  function parseTime(t) {
+    var m = String(t || '').match(/^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s?)?$/);
+    return m && t ? (+m[1] || 0) * 3600 + (+m[2] || 0) * 60 + (+m[3] || 0) : 0;
+  }
+  /** 貼られた URL を解釈する。空なら null、解釈できなければ {error}、できれば {type, ...}。 */
+  function parseVideo(url) {
+    url = String(url || '').trim();
+    if (!url) return null;
+    var u;
+    try { u = new URL(url); } catch (e) { return { error: 'URLの形式が正しくありません' }; }
+    if (u.protocol !== 'https:') return { error: 'https:// で始まるURLを貼ってください' };
+    var host = u.hostname.replace(/^(www|m|music)\./, ''), id = null;
+    if (host === 'youtu.be') id = u.pathname.slice(1).split('/')[0];
+    else if (host === 'youtube.com' || host === 'youtube-nocookie.com') {
+      if (u.pathname === '/watch') id = u.searchParams.get('v');
+      else { var m = u.pathname.match(/^\/(shorts|embed|live|v)\/([^/?]+)/); if (m) id = m[2]; }
+    }
+    if (id !== null) {
+      if (!/^[\w-]{11}$/.test(id)) return { error: 'YouTubeの動画URLを読み取れませんでした' };
+      return { type: 'youtube', id: id, start: parseTime(u.searchParams.get('t') || u.searchParams.get('start')) };
+    }
+    var path = u.pathname.toLowerCase();
+    if (/\.(mp4|webm|mov|m4v|ogv)$/.test(path)) return { type: 'video', src: url };
+    if (/\.(gif|webp|png|jpe?g|avif)$/.test(path)) return { type: 'image', src: url };
+    return { error: 'YouTube、または .mp4 / .gif などの直接リンクに対応しています' };
+  }
+  function videoKindLabel(v) { return v.type === 'youtube' ? 'YouTube動画' : v.type === 'video' ? '動画ファイル' : 'アニメーション画像'; }
+
+  /** ループ再生する動画の要素を作る（YouTube は loop+playlist、動画ファイルは loop 属性、音は消して自動再生）。 */
+  function videoNode(v) {
+    var box = document.createElement('div');
+    box.className = 'vid';
+    if (v.type === 'youtube') {
+      var f = document.createElement('iframe');
+      f.src = 'https://www.youtube-nocookie.com/embed/' + v.id + '?autoplay=1&mute=1&loop=1&playlist=' + v.id +
+        '&playsinline=1&rel=0&modestbranding=1' + (v.start ? '&start=' + v.start : '');
+      f.title = 'フォーム動画';
+      f.allow = 'autoplay; encrypted-media; picture-in-picture; fullscreen';
+      f.allowFullscreen = true;
+      f.referrerPolicy = 'strict-origin-when-cross-origin';
+      box.appendChild(f);
+    } else if (v.type === 'video') {
+      var el = document.createElement('video');
+      el.src = v.src; el.loop = true; el.muted = true; el.autoplay = true; el.controls = true; el.playsInline = true;
+      el.setAttribute('muted', ''); el.setAttribute('playsinline', ''); el.preload = 'auto';
+      el.addEventListener('error', function () { box.innerHTML = '<div class="vid-err">動画を読み込めませんでした。URLを確認してください。</div>'; });
+      box.appendChild(el);
+    } else {
+      var img = document.createElement('img');
+      img.src = v.src; img.alt = 'フォーム動画';
+      img.addEventListener('error', function () { box.innerHTML = '<div class="vid-err">画像を読み込めませんでした。URLを確認してください。</div>'; });
+      box.appendChild(img);
+    }
+    return box;
+  }
+  var openVid = {};
 
   // ---- 小物 ----
   var $ = function (sel, root) { return (root || document).querySelector(sel); };
@@ -721,8 +779,16 @@
         }).join('') + '</div>' +
         '<div class="grid3" style="margin-top:10px;grid-template-columns:repeat(' + (isW ? 4 : 3) + ',1fr)">' +
         mini('セット', 'sets', e.sets, 'numeric') + mini(e.kind === 'time' ? '秒' : '回数', 'reps', e.reps, 'numeric') +
-        (isW ? mini('重さkg', 'weight', e.weight, 'decimal') : '') + mini('休憩秒', 'rest', e.rest, 'numeric') + '</div></div>';
+        (isW ? mini('重さkg', 'weight', e.weight, 'decimal') : '') + mini('休憩秒', 'rest', e.rest, 'numeric') + '</div>' +
+        '<div class="row" style="margin-top:10px"><input class="input grow" type="url" inputmode="url" data-f="video" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="フォーム動画のURL（YouTube・mp4・gif）" value="' + esc(e.video) + '">' +
+        '<button class="btn sm" data-act="ex-paste">貼付</button><button class="btn sm" data-act="ex-find">探す</button></div>' +
+        '<div class="vid-state small" data-vstate>' + videoStateHtml(e.video) + '</div></div>';
     }).join('');
+  }
+  function videoStateHtml(url) {
+    var v = parseVideo(url);
+    if (!v) return '<span class="muted">貼り付けると、トレーニング中にループ再生できます</span>';
+    return v.error ? '<span style="color:var(--danger)">' + esc(v.error) + '</span>' : '<span style="color:var(--good)">✓ ' + videoKindLabel(v) + 'を認識しました</span>';
   }
   function mini(label, f, v, mode) {
     return '<label class="mini"><span>' + label + '</span><input class="input tnum" type="number" inputmode="' + mode + '" data-f="' + f + '" value="' + esc(v) + '"></label>';
@@ -735,7 +801,7 @@
       var e = editing.exercises[+card.getAttribute('data-i')];
       Array.prototype.forEach.call(card.querySelectorAll('[data-f]'), function (inp) {
         var f = inp.getAttribute('data-f');
-        e[f] = f === 'name' ? inp.value : inp.value === '' ? '' : +inp.value;
+        e[f] = f === 'name' || f === 'video' ? inp.value : inp.value === '' ? '' : +inp.value;
       });
     });
   }
@@ -762,7 +828,7 @@
           });
         }
         return {
-          name: e.name, kind: e.kind || 'weight', rest: +e.rest || 0, target: { sets: e.sets, reps: e.reps, weight: e.weight },
+          name: e.name, kind: e.kind || 'weight', video: e.video || '', rest: +e.rest || 0, target: { sets: e.sets, reps: e.reps, weight: e.weight },
           prev: prev ? prev.map(function (s) { return { w: +s.weight, r: +s.reps }; }) : null,
           best: h ? Math.max.apply(null, h.map(function (x) { return x.m.best; })) : 0,
           sets: sets
@@ -783,6 +849,7 @@
       $('#layer').insertAdjacentHTML('afterbegin', '<div class="workout" role="dialog" aria-label="トレーニング"></div>');
       w = $('.workout');
     }
+    openVid = {};
     w.innerHTML = workoutHtml();
     document.body.style.overflow = 'hidden';
     requestWake();
@@ -820,6 +887,7 @@
     var bestTxt = e.best ? (isW ? '推定1RM ' + fmtNum(e.best) + 'kg' : fmtNum(e.best) + (e.kind === 'time' ? '秒' : '回')) : '';
     var h = '<div class="ex-card' + (allDone ? ' done' : '') + '" data-ei="' + ei + '"><div class="row"><div class="grow"><h4>' + esc(e.name) + '</h4>' +
       '<div class="sub">目標 ' + tgt + (bestTxt ? ' ・ ベスト ' + bestTxt : '') + ' ・ 休憩' + e.rest + '秒</div></div><span class="pill">' + KIND_LABEL[e.kind] + '</span></div>' +
+      (hasVideo(e) ? '<button class="vid-toggle" data-act="w-video">' + (openVid[ei] ? '■ 動画を閉じる' : '▶ フォーム動画を見る（ループ再生）') + '</button>' : '') +
       '<div class="set-head' + (isW ? '' : ' no-w') + '"><span>SET</span>' + (isW ? '<span>KG</span>' : '') + '<span>' + (e.kind === 'time' ? '秒' : '回') + '</span><span></span></div>';
     e.sets.forEach(function (s, si) {
       var p = e.prev ? e.prev[si] : null;
@@ -841,9 +909,17 @@
       '<button data-act="w-step" data-f="' + f + '" data-d="1" aria-label="増やす">＋</button></div>';
   }
 
+  function hasVideo(e) { var v = parseVideo(e.video); return !!v && !v.error; }
+
+  /** セット完了などでカードを描き直しても、再生中の動画は同じ要素のまま残して頭出しに戻さない。 */
   function rerenderExCard(ei) {
     var card = document.querySelector('.ex-card[data-ei="' + ei + '"]');
-    if (card) card.outerHTML = exCardHtml(draft.exercises[ei], ei);
+    if (card) {
+      var keep = card.querySelector('.vid');
+      card.outerHTML = exCardHtml(draft.exercises[ei], ei);
+      var fresh = document.querySelector('.ex-card[data-ei="' + ei + '"]');
+      if (keep && fresh && fresh.querySelector('.vid-toggle')) fresh.querySelector('.vid-toggle').after(keep);
+    }
     updateProgress();
   }
 
@@ -1317,6 +1393,20 @@
       saveMenu({ id: uid(), name: name, order: state.data.menus.length, exercises: JSON.parse(JSON.stringify(t.exercises)) });
       toast('「' + name + '」を追加しました');
     },
+    'ex-paste': function (el) {
+      var inp = el.closest('.row').querySelector('input');
+      var hint = function () { toast('入力欄を長押しして「ペースト」してください'); inp.focus(); };
+      if (!navigator.clipboard || !navigator.clipboard.readText) { hint(); return; }
+      navigator.clipboard.readText().then(function (t) {
+        inp.value = String(t || '').trim();
+        inp.closest('.card').querySelector('[data-vstate]').innerHTML = videoStateHtml(inp.value);
+      }, hint);
+    },
+    'ex-find': function (el) {
+      var card = el.closest('.card'), name = card.querySelector('input[data-f="name"]').value.trim();
+      if (!name) { toast('先に種目名を入力してください', true); return; }
+      window.open('https://www.youtube.com/results?search_query=' + encodeURIComponent(name + ' やり方 フォーム'), '_blank', 'noopener');
+    },
     'ex-add': function () { syncEditorFields(); editing.exercises.push(ex('', 'bodyweight', 3, 10, 0, 60)); renderExList(); var c = document.querySelectorAll('#exList input[data-f="name"]'); c[c.length - 1].focus(); },
     'ex-del': function (el) {
       syncEditorFields();
@@ -1340,8 +1430,12 @@
       var m = editing;
       m.name = String(m.name || '').trim();
       m.exercises = m.exercises.filter(function (e) { return String(e.name).trim(); }).map(function (e) {
-        return { name: String(e.name).trim(), kind: e.kind, sets: Math.max(1, +e.sets || 1), reps: Math.max(1, +e.reps || 1), weight: Math.max(0, +e.weight || 0), rest: Math.max(0, +e.rest || 0) };
+        return { name: String(e.name).trim(), kind: e.kind, sets: Math.max(1, +e.sets || 1), reps: Math.max(1, +e.reps || 1), weight: Math.max(0, +e.weight || 0), rest: Math.max(0, +e.rest || 0), video: String(e.video || '').trim() };
       });
+      for (var vi = 0; vi < m.exercises.length; vi++) {
+        var pv = parseVideo(m.exercises[vi].video);
+        if (pv && pv.error) { toast('「' + m.exercises[vi].name + '」の動画：' + pv.error, true); return; }
+      }
       if (!m.name) { toast('メニュー名を入力してください', true); return; }
       if (!m.exercises.length) { toast('種目名を入力してください', true); return; }
       if (!m.id) { m.id = uid(); m.order = state.data.menus.length; }
@@ -1441,6 +1535,24 @@
       var ei = +el.closest('[data-ei]').getAttribute('data-ei'), si = +el.closest('[data-si]').getAttribute('data-si');
       markDone(ei, si, !draft.exercises[ei].sets[si].done);
     },
+    'w-video': function (el) {
+      var card = el.closest('[data-ei]'), ei = +card.getAttribute('data-ei');
+      if (card.querySelector('.vid')) {
+        card.querySelector('.vid').remove(); openVid[ei] = false;
+        el.textContent = '▶ フォーム動画を見る（ループ再生）';
+        return;
+      }
+      var v = parseVideo(draft.exercises[ei].video);
+      if (!v || v.error) { toast('動画のURLを確認してください', true); return; }
+      // 同時に何本も読み込まないよう、ほかの動画は閉じる
+      Array.prototype.forEach.call(document.querySelectorAll('.workout .ex-card .vid'), function (n) {
+        var c = n.closest('[data-ei]'); n.remove(); openVid[+c.getAttribute('data-ei')] = false;
+        c.querySelector('.vid-toggle').textContent = '▶ フォーム動画を見る（ループ再生）';
+      });
+      el.after(videoNode(v));
+      openVid[ei] = true;
+      el.textContent = '■ 動画を閉じる';
+    },
     'w-hold': function (el) {
       startHold(+el.closest('[data-ei]').getAttribute('data-ei'), +el.closest('[data-si]').getAttribute('data-si'));
     },
@@ -1510,6 +1622,10 @@
       draft.exercises[ei].sets[+si][t.getAttribute('data-f')] = t.value === '' ? 0 : +t.value;
       saveDraft();
     }
+  });
+  document.addEventListener('input', function (ev) {
+    var t = ev.target;
+    if (t.matches && t.matches('#exList input[data-f="video"]')) t.closest('.card').querySelector('[data-vstate]').innerHTML = videoStateHtml(t.value);
   });
   document.addEventListener('focusin', function (ev) {
     if (ev.target.matches('.stepper input')) setTimeout(function () { ev.target.select(); }, 0);
